@@ -1,0 +1,21 @@
+# Local Codex Run-button actions for the CleanVideo workspace.
+version = 1
+name = "cleanvideo"
+
+[setup]
+script = ""
+
+[[actions]]
+name = "Launch CleanVideo"
+icon = "run"
+command = "powershell -NoProfile -ExecutionPolicy Bypass -File .\\scripts\\launch.ps1"
+
+[[actions]]
+name = "Run Server Only"
+icon = "run"
+command = "powershell -NoProfile -ExecutionPolicy Bypass -File .\\run.ps1"
+
+[[actions]]
+name = "Setup / Reinstall Dependencies"
+icon = "tool"
+command = "powershell -NoProfile -ExecutionPolicy Bypass -File .\\scripts\\setup.ps1"

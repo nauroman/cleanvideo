@@ -4,11 +4,25 @@ Local video enhancement UI for HYPIR with CUDA preview and H.264 export.
 
 ## Run
 
+On Windows, double-click:
+
+```text
+Start-CleanVideo.cmd
+```
+
+It starts the local server if needed and opens <http://127.0.0.1:8765>.
+
+From Codex, use the Run menu action:
+
+```text
+Launch CleanVideo
+```
+
+Server-only mode:
+
 ```powershell
 .\run.ps1
 ```
-
-Open <http://127.0.0.1:8765>.
 
 ## What is installed
 
