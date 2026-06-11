@@ -14,7 +14,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Literal
 
-from fastapi import BackgroundTasks, FastAPI, File, HTTPException, UploadFile
+from fastapi import BackgroundTasks, FastAPI, File, HTTPException, Query, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from PIL import Image
@@ -92,6 +92,7 @@ class JobState(BaseModel):
     currentFrameSeconds: float | None = None
     currentOriginalUrl: str | None = None
     currentEnhancedUrl: str | None = None
+    latestFrameSeq: int = 0
     cacheKey: str | None = None
     cacheHits: int = 0
     cacheMisses: int = 0
@@ -99,6 +100,17 @@ class JobState(BaseModel):
     outputPath: str | None = None
     error: str | None = None
     startedAt: str
+    updatedAt: str
+
+
+class FrameEvent(BaseModel):
+    seq: int
+    frameIndex: int
+    framesTotal: int
+    seconds: float
+    originalUrl: str
+    enhancedUrl: str
+    cached: bool = False
     updatedAt: str
 
 
@@ -113,6 +125,7 @@ app.add_middleware(
 
 videos: dict[str, dict] = {}
 jobs: dict[str, JobState] = {}
+job_frame_events: dict[str, list[FrameEvent]] = {}
 jobs_lock = threading.Lock()
 cancelled_jobs: set[str] = set()
 
@@ -153,6 +166,37 @@ def update_job(job_id: str, **changes) -> None:
         data.update(changes)
         data["updatedAt"] = now_iso()
         jobs[job_id] = JobState(**data)
+
+
+def add_frame_event(
+    job_id: str,
+    frame_index: int,
+    frames_total: int,
+    seconds: float,
+    original_path: Path,
+    enhanced_path: Path,
+    *,
+    cached: bool,
+) -> FrameEvent:
+    with jobs_lock:
+        events = job_frame_events.setdefault(job_id, [])
+        event = FrameEvent(
+            seq=len(events) + 1,
+            frameIndex=frame_index,
+            framesTotal=frames_total,
+            seconds=seconds,
+            originalUrl=media_url(original_path),
+            enhancedUrl=media_url(enhanced_path),
+            cached=cached,
+            updatedAt=now_iso(),
+        )
+        events.append(event)
+        if job_id in jobs:
+            data = jobs[job_id].model_dump()
+            data["latestFrameSeq"] = event.seq
+            data["updatedAt"] = event.updatedAt
+            jobs[job_id] = JobState(**data)
+        return event
 
 
 def media_url(path: Path) -> str:
@@ -275,6 +319,21 @@ def remove_generated_path(path: Path, *, recreate: bool) -> dict:
     return usage
 
 
+def schedule_generated_path_cleanup(path: Path, delay_seconds: int = 120) -> dict:
+    ensure_work_path(path)
+    usage = path_usage(path)
+
+    def cleanup_later() -> None:
+        time.sleep(delay_seconds)
+        try:
+            remove_generated_path(path, recreate=False)
+        except Exception:
+            pass
+
+    threading.Thread(target=cleanup_later, daemon=True).start()
+    return usage
+
+
 def clear_generated_dirs() -> dict:
     total_files = 0
     total_bytes = 0
@@ -335,6 +394,7 @@ def cleanup_generated() -> dict:
         raise HTTPException(status_code=500, detail=f"Cleanup failed: {exc}") from exc
     with jobs_lock:
         jobs.clear()
+        job_frame_events.clear()
     cancelled_jobs.clear()
     return result
 
@@ -484,6 +544,16 @@ def run_export(job_id: str, request: ExportRequest) -> None:
                 engine.enhance_file(frame, output, settings)
                 cache_misses_done += 1
 
+            frame_seconds = (index - 1) / fps
+            frame_event = add_frame_event(
+                job_id,
+                frame_index=index,
+                frames_total=total,
+                seconds=frame_seconds,
+                original_path=frame,
+                enhanced_path=output,
+                cached=cached,
+            )
             remaining_misses = max(0, missing_total - cache_misses_done)
             update_job(
                 job_id,
@@ -493,9 +563,10 @@ def run_export(job_id: str, request: ExportRequest) -> None:
                 framesDone=index,
                 framesTotal=total,
                 currentFrameIndex=index,
-                currentFrameSeconds=(index - 1) / fps,
+                currentFrameSeconds=frame_seconds,
                 currentOriginalUrl=media_url(frame),
                 currentEnhancedUrl=media_url(output),
+                latestFrameSeq=frame_event.seq,
                 cacheHits=cache_hits,
                 cacheMisses=cache_misses_done,
             )
@@ -510,10 +581,11 @@ def run_export(job_id: str, request: ExportRequest) -> None:
             crf=request.crf,
             encoder=request.encoder,
         )
-        cleanup_message = "Cleaned intermediate frames"
+        cleanup_message = "Scheduled intermediate cleanup"
         try:
-            cleanup_usage = remove_generated_path(cache_root, recreate=False)
-            cleanup_message = f"Cleaned {cleanup_usage['files']} intermediate files"
+            cleanup_delay = min(900, max(120, int(total * 0.04)))
+            cleanup_usage = schedule_generated_path_cleanup(cache_root, delay_seconds=cleanup_delay)
+            cleanup_message = f"Scheduled cleanup of {cleanup_usage['files']} intermediate files"
         except Exception as exc:
             cleanup_message = f"Intermediate cleanup failed: {exc}"
         update_job(
@@ -545,15 +617,17 @@ def export_video(request: ExportRequest, background_tasks: BackgroundTasks) -> d
     get_video(request.videoId)
     job_id = uuid.uuid4().hex
     stamp = now_iso()
-    jobs[job_id] = JobState(
-        id=job_id,
-        kind="export",
-        status="queued",
-        progress=0,
-        message="Queued",
-        startedAt=stamp,
-        updatedAt=stamp,
-    )
+    with jobs_lock:
+        jobs[job_id] = JobState(
+            id=job_id,
+            kind="export",
+            status="queued",
+            progress=0,
+            message="Queued",
+            startedAt=stamp,
+            updatedAt=stamp,
+        )
+        job_frame_events[job_id] = []
     background_tasks.add_task(run_export, job_id, request)
     return jobs[job_id].model_dump()
 
@@ -564,6 +638,26 @@ def get_job(job_id: str) -> dict:
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
     return job.model_dump()
+
+
+@app.get("/api/jobs/{job_id}/frames")
+def get_job_frames(
+    job_id: str,
+    after: int = Query(default=0, ge=0),
+    limit: int = Query(default=240, ge=1, le=500),
+) -> dict:
+    with jobs_lock:
+        if job_id not in jobs:
+            raise HTTPException(status_code=404, detail="Job not found")
+        events = job_frame_events.get(job_id, [])
+        selected = [event for event in events if event.seq > after][:limit]
+        latest_seq = events[-1].seq if events else 0
+    return {
+        "frames": [event.model_dump() for event in selected],
+        "nextAfter": selected[-1].seq if selected else after,
+        "latestSeq": latest_seq,
+        "hasMore": bool(selected and selected[-1].seq < latest_seq),
+    }
 
 
 @app.post("/api/jobs/{job_id}/cancel")

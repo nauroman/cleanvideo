@@ -9,6 +9,11 @@ const state = {
   exportInFlight: false,
   liveOriginalUrl: null,
   liveEnhancedUrl: null,
+  frameEventQueue: [],
+  frameEventsAfter: 0,
+  frameEventsInFlight: false,
+  framePlaybackTimer: null,
+  lastDisplayedFrameSeq: 0,
 };
 
 const settingsStorageKey = "cleanvideo.session.v1";
@@ -261,6 +266,7 @@ function updateScaleMode() {
 }
 
 function resetGeneratedUi() {
+  clearFramePlayback();
   state.currentJobId = null;
   state.liveOriginalUrl = null;
   state.liveEnhancedUrl = null;
@@ -411,6 +417,7 @@ async function runAutoPreview() {
 async function startExport() {
   if (!state.video) return;
   window.clearTimeout(state.previewTimer);
+  clearFramePlayback();
   state.exportInFlight = true;
   state.previewDirty = false;
   setExportEnabled(false);
@@ -432,6 +439,7 @@ async function startExport() {
       body: JSON.stringify(body),
     });
     state.currentJobId = job.id;
+    state.frameEventsAfter = 0;
     pollJob(job.id);
   } catch (error) {
     setActivity(`Export failed: ${error.message}`, 0);
@@ -490,6 +498,94 @@ async function clearGeneratedFiles() {
   }
 }
 
+function clearFramePlayback() {
+  if (state.framePlaybackTimer) {
+    window.clearTimeout(state.framePlaybackTimer);
+  }
+  state.framePlaybackTimer = null;
+  state.frameEventQueue = [];
+  state.frameEventsAfter = 0;
+  state.frameEventsInFlight = false;
+  state.lastDisplayedFrameSeq = 0;
+}
+
+function displayFrameEvent(frame) {
+  if (!frame?.originalUrl || !frame?.enhancedUrl) return;
+  const cacheBust = `?job=${encodeURIComponent(state.currentJobId || "")}&frame=${frame.seq}`;
+  const originalUrl = `${frame.originalUrl}${cacheBust}`;
+  const enhancedUrl = `${frame.enhancedUrl}${cacheBust}`;
+  if (state.liveOriginalUrl !== originalUrl) {
+    els.originalPreview.src = originalUrl;
+    state.liveOriginalUrl = originalUrl;
+  }
+  if (state.liveEnhancedUrl !== enhancedUrl) {
+    els.enhancedPreview.src = enhancedUrl;
+    state.liveEnhancedUrl = enhancedUrl;
+  }
+
+  els.sourceVideo.hidden = true;
+  els.originalPreview.hidden = false;
+  els.enhancedPreview.hidden = false;
+  els.originalEmpty.hidden = true;
+  els.enhancedEmpty.hidden = true;
+  if (Number.isFinite(frame.seconds)) {
+    els.timeline.value = String(frame.seconds);
+    els.currentTime.textContent = formatTime(frame.seconds);
+  }
+  els.originalInfo.textContent = `frame ${frame.frameIndex} | ${formatTime(frame.seconds)}`;
+  els.enhancedInfo.textContent = frame.cached
+    ? `frame ${frame.frameIndex} / ${frame.framesTotal} | cached`
+    : `frame ${frame.frameIndex} / ${frame.framesTotal} | generated`;
+  state.lastDisplayedFrameSeq = frame.seq;
+}
+
+function framePlaybackDelay() {
+  if (state.frameEventQueue.length > 120) return 30;
+  if (state.frameEventQueue.length > 40) return 60;
+  return 120;
+}
+
+function playFrameQueue() {
+  if (state.framePlaybackTimer || !state.frameEventQueue.length) return;
+  displayFrameEvent(state.frameEventQueue.shift());
+  state.framePlaybackTimer = window.setTimeout(() => {
+    state.framePlaybackTimer = null;
+    playFrameQueue();
+  }, framePlaybackDelay());
+}
+
+async function fetchFrameEvents(jobId, { allowInactive = false } = {}) {
+  if (!jobId || state.frameEventsInFlight) return false;
+  state.frameEventsInFlight = true;
+  try {
+    const result = await api(`/api/jobs/${jobId}/frames?after=${state.frameEventsAfter}&limit=240`);
+    if (!allowInactive && jobId !== state.currentJobId) return false;
+    if (result.frames?.length) {
+      state.frameEventsAfter = result.nextAfter;
+      state.frameEventQueue.push(...result.frames);
+      playFrameQueue();
+    }
+    if (result.hasMore && !allowInactive && jobId === state.currentJobId) {
+      window.setTimeout(() => fetchFrameEvents(jobId), 50);
+    }
+    return Boolean(result.hasMore);
+  } catch (error) {
+    if (jobId === state.currentJobId) {
+      setActivity(`Frame viewer update failed: ${error.message}`, null);
+    }
+    return false;
+  } finally {
+    state.frameEventsInFlight = false;
+  }
+}
+
+async function fetchRemainingFrameEvents(jobId) {
+  for (let attempt = 0; attempt < 50; attempt += 1) {
+    const hasMore = await fetchFrameEvents(jobId, { allowInactive: true });
+    if (!hasMore) return;
+  }
+}
+
 function updateLiveFrame(job) {
   if (!job.currentOriginalUrl || !job.currentEnhancedUrl) return;
   const originalUrl = `${job.currentOriginalUrl}?t=${job.updatedAt}`;
@@ -528,7 +624,9 @@ function updateJobUi(job) {
     els.frameProgressText.textContent = "Frames: preparing";
   }
   els.etaText.textContent = `ETA: ${formatDuration(job.etaSeconds)}`;
-  updateLiveFrame(job);
+  if (state.frameEventsAfter === 0 && !state.frameEventQueue.length) {
+    updateLiveFrame(job);
+  }
 }
 
 function pollJob(jobId) {
@@ -536,8 +634,10 @@ function pollJob(jobId) {
   state.jobTimer = setInterval(async () => {
     try {
       const job = await api(`/api/jobs/${jobId}`);
+      await fetchFrameEvents(jobId);
       updateJobUi(job);
       if (job.status === "done") {
+        await fetchRemainingFrameEvents(jobId);
         clearInterval(state.jobTimer);
         state.jobTimer = null;
         els.downloadLink.href = job.outputUrl;
