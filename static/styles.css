@@ -230,10 +230,20 @@ button {
   color: #111;
 }
 
+.file-button span {
+  padding: 0 22px;
+}
+
 .secondary-button {
   border: 1px solid var(--line-strong);
   background: var(--panel-2);
   color: var(--text);
+}
+
+#exportButton {
+  border-color: #d9f26b;
+  background: #d9f26b;
+  color: #111;
 }
 
 .primary-button,
@@ -620,7 +630,7 @@ svg {
 
   .file-button span {
     min-width: 72px;
-    padding: 0 10px;
+    padding: 0 18px;
     text-align: center;
   }
 
