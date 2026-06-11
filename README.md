@@ -11,12 +11,15 @@ Start-CleanVideo.cmd
 ```
 
 It starts the local server if needed and opens <http://127.0.0.1:8765>.
+If an idle CleanVideo server is already running, the launcher restarts it so the latest local code is used.
 
 From Codex, use the Run menu action:
 
 ```text
 Launch CleanVideo
 ```
+
+Use `Force Restart CleanVideo` only after stopping any export you want to keep running.
 
 Server-only mode:
 

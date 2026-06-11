@@ -186,6 +186,7 @@ function saveLocalState() {
   const payload = {
     settings: collectUiSettings(),
     videoId: state.video?.id ?? null,
+    currentJobId: state.exportInFlight ? state.currentJobId : null,
   };
   localStorage.setItem(settingsStorageKey, JSON.stringify(payload));
 }
@@ -320,16 +321,71 @@ function setVideo(record, { persist = true } = {}) {
 async function restoreSession() {
   const saved = readLocalState();
   applySavedSettings(saved.settings);
-  if (!saved.videoId) return;
+  let restoredVideo = false;
   try {
+    if (saved.videoId) {
+      const result = await api("/api/videos");
+      const record = result.videos.find((video) => video.id === saved.videoId);
+      if (record) {
+        restoredVideo = true;
+        setVideo(record, { persist: false });
+      }
+    }
+    await restoreActiveExport(saved.currentJobId, { restoredVideo });
+  } catch (error) {
+    setActivity(`Could not restore session: ${error.message}`, 0);
+  }
+}
+
+async function restoreActiveExport(savedJobId, { restoredVideo = false } = {}) {
+  let job = null;
+  if (savedJobId) {
+    try {
+      job = await api(`/api/jobs/${savedJobId}`);
+    } catch {
+      job = null;
+    }
+  }
+
+  if (!job || !["queued", "running"].includes(job.status)) {
+    try {
+      const result = await api("/api/jobs");
+      job = result.jobs.find((candidate) => (
+        candidate.kind === "export" && ["queued", "running"].includes(candidate.status)
+      ));
+    } catch {
+      job = null;
+    }
+  }
+
+  if (!job) return;
+
+  if (!state.video && job.videoId) {
     const result = await api("/api/videos");
-    const record = result.videos.find((video) => video.id === saved.videoId);
+    const record = result.videos.find((video) => video.id === job.videoId);
     if (record) {
+      restoredVideo = true;
       setVideo(record, { persist: false });
     }
-  } catch (error) {
-    setActivity(`Could not restore last video: ${error.message}`, 0);
   }
+
+  resumeExportJob(job, { restoredVideo });
+}
+
+function resumeExportJob(job, { restoredVideo = false } = {}) {
+  clearFramePlayback();
+  state.exportInFlight = true;
+  state.previewDirty = false;
+  state.currentJobId = job.id;
+  setExportEnabled(false);
+  if (restoredVideo) {
+    window.clearTimeout(state.previewTimer);
+  }
+  els.downloadLink.hidden = true;
+  updateJobUi(job);
+  saveLocalState();
+  fetchFrameEvents(job.id);
+  pollJob(job.id);
 }
 
 async function refreshStatus() {
@@ -440,6 +496,7 @@ async function startExport() {
     });
     state.currentJobId = job.id;
     state.frameEventsAfter = 0;
+    saveLocalState();
     pollJob(job.id);
   } catch (error) {
     setActivity(`Export failed: ${error.message}`, 0);
@@ -644,6 +701,7 @@ function pollJob(jobId) {
         els.downloadLink.hidden = false;
         state.exportInFlight = false;
         state.currentJobId = null;
+        saveLocalState();
         setExportEnabled(true);
         await refreshStatus();
       }
@@ -653,6 +711,7 @@ function pollJob(jobId) {
         setActivity(job.status === "cancelled" ? job.message : `Export failed: ${job.error || job.message}`, job.progress);
         state.exportInFlight = false;
         state.currentJobId = null;
+        saveLocalState();
         setExportEnabled(true);
       }
     } catch (error) {
@@ -661,6 +720,7 @@ function pollJob(jobId) {
       setActivity(`Job polling failed: ${error.message}`, 0);
       state.exportInFlight = false;
       state.currentJobId = null;
+      saveLocalState();
       setExportEnabled(true);
     }
   }, 700);

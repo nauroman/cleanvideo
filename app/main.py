@@ -42,6 +42,7 @@ CACHE_DIR = WORK_DIR / "cache"
 for directory in [UPLOAD_DIR, PREVIEW_DIR, EXPORT_DIR, JOB_DIR, CACHE_DIR]:
     directory.mkdir(parents=True, exist_ok=True)
 GENERATED_DIRS = [PREVIEW_DIR, CACHE_DIR, JOB_DIR, EXPORT_DIR]
+APP_BUILD = "2026-06-10-frame-events-v3"
 
 
 class ProcessSettings(BaseModel):
@@ -85,6 +86,7 @@ class JobState(BaseModel):
     status: Literal["queued", "running", "done", "error", "cancelled"]
     progress: float
     message: str
+    videoId: str | None = None
     etaSeconds: float | None = None
     framesDone: int = 0
     framesTotal: int = 0
@@ -358,13 +360,17 @@ def startup() -> None:
 
 @app.get("/api/status")
 def status() -> dict:
+    with jobs_lock:
+        active_jobs = sum(1 for job in jobs.values() if job.status in {"queued", "running"})
     return {
         "app": "CleanVideo",
+        "build": APP_BUILD,
         "hypir": engine.status(),
         "ffmpeg": True,
         "nvenc": h264_nvenc_available(),
         "videos": len(videos),
         "jobs": len(jobs),
+        "activeJobs": active_jobs,
     }
 
 
@@ -624,12 +630,20 @@ def export_video(request: ExportRequest, background_tasks: BackgroundTasks) -> d
             status="queued",
             progress=0,
             message="Queued",
+            videoId=request.videoId,
             startedAt=stamp,
             updatedAt=stamp,
         )
         job_frame_events[job_id] = []
     background_tasks.add_task(run_export, job_id, request)
     return jobs[job_id].model_dump()
+
+
+@app.get("/api/jobs")
+def list_jobs() -> dict:
+    with jobs_lock:
+        ordered = sorted(jobs.values(), key=lambda job: job.startedAt, reverse=True)
+    return {"jobs": [job.model_dump() for job in ordered]}
 
 
 @app.get("/api/jobs/{job_id}")
