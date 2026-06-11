@@ -52,6 +52,8 @@ During export, enhanced frames are cached under `work/cache` using the selected 
 
 The `Temporal` export setting reduces frame-to-frame flicker by optical-flow warping the previous enhanced frame onto the current source frame and blending stable areas after each HYPIR pass. `Medium` is the default balance; `Strong` and `Extra Strong` can be steadier but may soften fast motion or add ghosting, and `Off` preserves the old independent-frame behavior.
 
+The `0.5x` scale factor performs high-quality Lanczos downscaling before HYPIR enhancement, producing half-width and half-height output while giving the generator a smaller, cleaner input.
+
 ## Reinstall dependencies
 
 ```powershell

@@ -43,14 +43,14 @@ CACHE_DIR = WORK_DIR / "cache"
 for directory in [UPLOAD_DIR, PREVIEW_DIR, EXPORT_DIR, JOB_DIR, CACHE_DIR]:
     directory.mkdir(parents=True, exist_ok=True)
 GENERATED_DIRS = [PREVIEW_DIR, CACHE_DIR, JOB_DIR, EXPORT_DIR]
-APP_BUILD = "2026-06-11-temporal-extra-strong-v1"
+APP_BUILD = "2026-06-11-half-upscale-v1"
 
 
 class ProcessSettings(BaseModel):
     engine: Literal["hypir"] = "hypir"
     prompt: str = ""
     scaleBy: Literal["factor", "longest_side"] = "factor"
-    upscale: int = Field(default=1, ge=1, le=8)
+    upscale: float = Field(default=1, ge=0.5, le=8)
     targetLongestSide: int | None = Field(default=None, ge=256, le=8192)
     patchSize: int = Field(default=512, ge=512, le=1024)
     stride: int = Field(default=256, ge=128, le=1024)
@@ -231,7 +231,11 @@ def video_fingerprint(record: dict) -> dict:
 
 
 def enhancement_settings(request: ExportRequest) -> dict:
-    return request.model_dump(exclude={"crf", "encoder"}, mode="json")
+    settings = request.model_dump(exclude={"crf", "encoder"}, mode="json")
+    upscale = settings.get("upscale")
+    if isinstance(upscale, float) and upscale.is_integer():
+        settings["upscale"] = int(upscale)
+    return settings
 
 
 def enhancement_cache_key(record: dict, request: ExportRequest) -> str:

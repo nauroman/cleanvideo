@@ -4,7 +4,7 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>CleanVideo</title>
-    <link rel="stylesheet" href="/styles.css?v=2026-06-11-temporal-extra-strong-v1" />
+    <link rel="stylesheet" href="/styles.css?v=2026-06-11-half-upscale-v1" />
   </head>
   <body>
     <main class="app-shell">
@@ -155,11 +155,12 @@
                 class="help-button"
                 type="button"
                 aria-label="Upscale help"
-                data-tooltip="Multiplies the original width and height. 1x keeps the same resolution, 2x doubles both dimensions, and 4x makes each frame much larger. Higher values take much longer and use more VRAM."
+                data-tooltip="Sets the frame size before HYPIR. 0.5x halves width and height with high-quality Lanczos downscaling before enhancement, 1x keeps the same resolution, and 2x or 4x make each frame larger. Higher values take much longer and use more VRAM."
               >?</button>
             </span>
             <select id="upscale" aria-label="Upscale">
-              <option value="1">1x</option>
+              <option value="0.5">0.5x</option>
+              <option value="1" selected>1x</option>
               <option value="2">2x</option>
               <option value="3">3x</option>
               <option value="4">4x</option>
@@ -292,6 +293,6 @@
         </section>
       </aside>
     </main>
-    <script src="/app.js?v=2026-06-11-temporal-extra-strong-v1" type="module"></script>
+    <script src="/app.js?v=2026-06-11-half-upscale-v1" type="module"></script>
   </body>
 </html>

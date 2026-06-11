@@ -41,7 +41,7 @@ LORA_MODULES = [
 class HypirSettings:
     prompt: str = ""
     scale_by: str = "factor"
-    upscale: int = 1
+    upscale: float = 1
     target_longest_side: int | None = None
     patch_size: int = 512
     stride: int = 256
@@ -128,12 +128,22 @@ class HypirEngine:
                 torch.cuda.manual_seed_all(seed)
 
             image = Image.open(input_path).convert("RGB")
+            model_upscale = settings.upscale
+            if scale_by == "factor" and 0 < settings.upscale < 1:
+                image = image.resize(
+                    (
+                        max(1, round(image.width * settings.upscale)),
+                        max(1, round(image.height * settings.upscale)),
+                    ),
+                    Image.Resampling.LANCZOS,
+                )
+                model_upscale = 1
             tensor = self._to_tensor(image).unsqueeze(0)
             result = self._model.enhance(
                 lq=tensor,
                 prompt=settings.prompt,
                 scale_by=scale_by,
-                upscale=settings.upscale,
+                upscale=model_upscale,
                 target_longest_side=target_longest_side,
                 patch_size=settings.patch_size,
                 stride=settings.stride,
@@ -148,4 +158,3 @@ class HypirEngine:
 
 
 engine = HypirEngine()
-
