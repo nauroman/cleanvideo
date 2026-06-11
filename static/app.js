@@ -59,6 +59,7 @@ const els = {
   upscaleField: document.querySelector("#upscaleField"),
   patchSize: document.querySelector("#patchSize"),
   stride: document.querySelector("#stride"),
+  temporalConsistency: document.querySelector("#temporalConsistency"),
   seed: document.querySelector("#seed"),
   prompt: document.querySelector("#prompt"),
   encoder: document.querySelector("#encoder"),
@@ -175,6 +176,7 @@ function collectUiSettings() {
     targetLongestSide: els.targetLongestSide.value,
     patchSize: els.patchSize.value,
     stride: els.stride.value,
+    temporalConsistency: els.temporalConsistency.value,
     seed: els.seed.value,
     prompt: els.prompt.value,
     encoder: els.encoder.value,
@@ -206,6 +208,7 @@ function applySavedSettings(settings = {}) {
     ["targetLongestSide", els.targetLongestSide],
     ["patchSize", els.patchSize],
     ["stride", els.stride],
+    ["temporalConsistency", els.temporalConsistency],
     ["seed", els.seed],
     ["prompt", els.prompt],
     ["encoder", els.encoder],
@@ -253,6 +256,7 @@ function collectSettings() {
     targetLongestSide: scaleBy === "longest_side" ? presetLongestSide || Number(els.targetLongestSide.value) : null,
     patchSize,
     stride,
+    temporalConsistency: els.temporalConsistency.value,
     seed: Number(els.seed.value),
     device: "cuda",
   };
@@ -792,6 +796,7 @@ els.stride.addEventListener("change", () => {
   saveLocalState();
   scheduleAutoPreview();
 });
+els.temporalConsistency.addEventListener("change", saveLocalState);
 els.seed.addEventListener("input", () => {
   saveLocalState();
   scheduleAutoPreview();

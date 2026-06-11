@@ -21,6 +21,7 @@ from PIL import Image
 from pydantic import BaseModel, Field
 
 from .hypir_engine import HypirSettings, engine
+from .temporal_stabilizer import TemporalConsistency, stabilize_frame, temporal_mode_enabled
 from .video_ops import (
     encode_video,
     extract_frame,
@@ -42,7 +43,7 @@ CACHE_DIR = WORK_DIR / "cache"
 for directory in [UPLOAD_DIR, PREVIEW_DIR, EXPORT_DIR, JOB_DIR, CACHE_DIR]:
     directory.mkdir(parents=True, exist_ok=True)
 GENERATED_DIRS = [PREVIEW_DIR, CACHE_DIR, JOB_DIR, EXPORT_DIR]
-APP_BUILD = "2026-06-10-frame-events-v3"
+APP_BUILD = "2026-06-11-temporal-v1"
 
 
 class ProcessSettings(BaseModel):
@@ -54,6 +55,7 @@ class ProcessSettings(BaseModel):
     patchSize: int = Field(default=512, ge=512, le=1024)
     stride: int = Field(default=256, ge=128, le=1024)
     seed: int = Field(default=231, ge=-1)
+    temporalConsistency: TemporalConsistency = "medium"
     device: Literal["cuda"] = "cuda"
 
     def to_hypir(self) -> HypirSettings:
@@ -513,6 +515,9 @@ def run_export(job_id: str, request: ExportRequest) -> None:
         cache_misses_done = 0
         generation_elapsed = 0.0
         latest_frame_seq = 0
+        temporal_enabled = temporal_mode_enabled(request.temporalConsistency)
+        previous_source_frame: Path | None = None
+        previous_enhanced_frame: Path | None = None
 
         for index, (frame, output, cached) in enumerate(outputs, start=1):
             if job_id in cancelled_jobs:
@@ -551,7 +556,22 @@ def run_export(job_id: str, request: ExportRequest) -> None:
                 frame_event = None
             else:
                 frame_started = time.monotonic()
-                engine.enhance_file(frame, output, settings)
+                if temporal_enabled and previous_source_frame and previous_enhanced_frame:
+                    raw_output = output.with_name(f"{output.stem}.hypir_tmp{output.suffix}")
+                    try:
+                        engine.enhance_file(frame, raw_output, settings)
+                        stabilize_frame(
+                            previous_source_path=previous_source_frame,
+                            current_source_path=frame,
+                            previous_enhanced_path=previous_enhanced_frame,
+                            current_enhanced_path=raw_output,
+                            output_path=output,
+                            mode=request.temporalConsistency,
+                        )
+                    finally:
+                        raw_output.unlink(missing_ok=True)
+                else:
+                    engine.enhance_file(frame, output, settings)
                 generation_elapsed += time.monotonic() - frame_started
                 cache_misses_done += 1
                 frame_event = add_frame_event(
@@ -582,6 +602,8 @@ def run_export(job_id: str, request: ExportRequest) -> None:
                 cacheHits=cache_hits,
                 cacheMisses=cache_misses_done,
             )
+            previous_source_frame = frame
+            previous_enhanced_frame = output
 
         write_cache_manifest(cache_root, record, request, "complete")
         update_job(job_id, progress=0.92, message="Encoding H.264 video", etaSeconds=None)

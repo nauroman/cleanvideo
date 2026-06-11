@@ -15,4 +15,4 @@ python-multipart==0.0.20
 aiofiles==24.1.0
 huggingface-hub==0.29.3
 safetensors==0.5.3
-
+opencv-python-headless==4.11.0.86
