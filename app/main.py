@@ -267,12 +267,12 @@ def reusable_frames(video_path: Path, frames_dir: Path, expected_count: int) -> 
     return extract_frames(video_path, frames_dir)
 
 
-def eta_seconds(started: float, completed_misses: int, remaining_misses: int) -> float | None:
+def eta_seconds(generation_elapsed: float, completed_misses: int, remaining_misses: int) -> float | None:
     if remaining_misses <= 0:
         return 0.0
     if completed_misses <= 0:
         return None
-    elapsed = max(0.0, time.monotonic() - started)
+    elapsed = max(0.0, generation_elapsed)
     return elapsed / completed_misses * remaining_misses
 
 
@@ -504,13 +504,17 @@ def run_export(job_id: str, request: ExportRequest) -> None:
         frames = reusable_frames(source, raw_frames, expected_count)
         total = len(frames)
         settings = request.to_hypir()
-        outputs = [(frame, enhanced_frames / frame.name) for frame in frames]
-        missing_total = sum(1 for _, output in outputs if not valid_image(output))
+        outputs = [
+            (frame, enhanced_frames / frame.name, valid_image(enhanced_frames / frame.name))
+            for frame in frames
+        ]
+        missing_total = sum(1 for _, _, cached in outputs if not cached)
         cache_hits = total - missing_total
         cache_misses_done = 0
-        started = time.monotonic()
+        generation_elapsed = 0.0
+        latest_frame_seq = 0
 
-        for index, (frame, output) in enumerate(outputs, start=1):
+        for index, (frame, output, cached) in enumerate(outputs, start=1):
             if job_id in cancelled_jobs:
                 write_cache_manifest(cache_root, record, request, "cancelled")
                 update_job(
@@ -525,7 +529,6 @@ def run_export(job_id: str, request: ExportRequest) -> None:
                 cancelled_jobs.discard(job_id)
                 return
 
-            cached = valid_image(output)
             remaining_misses = max(0, missing_total - cache_misses_done)
             update_job(
                 job_id,
@@ -534,7 +537,7 @@ def run_export(job_id: str, request: ExportRequest) -> None:
                     f"Using cached frame {index} / {total}"
                     if cached else f"Enhancing frame {index} / {total}"
                 ),
-                etaSeconds=eta_seconds(started, cache_misses_done, remaining_misses),
+                etaSeconds=eta_seconds(generation_elapsed, cache_misses_done, remaining_misses),
                 framesDone=index - 1,
                 framesTotal=total,
                 currentFrameIndex=index,
@@ -545,34 +548,37 @@ def run_export(job_id: str, request: ExportRequest) -> None:
                 cacheMisses=cache_misses_done,
             )
             if cached:
-                pass
+                frame_event = None
             else:
+                frame_started = time.monotonic()
                 engine.enhance_file(frame, output, settings)
+                generation_elapsed += time.monotonic() - frame_started
                 cache_misses_done += 1
+                frame_event = add_frame_event(
+                    job_id,
+                    frame_index=index,
+                    frames_total=total,
+                    seconds=(index - 1) / fps,
+                    original_path=frame,
+                    enhanced_path=output,
+                    cached=False,
+                )
+                latest_frame_seq = frame_event.seq
 
             frame_seconds = (index - 1) / fps
-            frame_event = add_frame_event(
-                job_id,
-                frame_index=index,
-                frames_total=total,
-                seconds=frame_seconds,
-                original_path=frame,
-                enhanced_path=output,
-                cached=cached,
-            )
             remaining_misses = max(0, missing_total - cache_misses_done)
             update_job(
                 job_id,
                 progress=0.05 + index / max(total, 1) * 0.84,
                 message=f"Frame {index} / {total} ready",
-                etaSeconds=eta_seconds(started, cache_misses_done, remaining_misses),
+                etaSeconds=eta_seconds(generation_elapsed, cache_misses_done, remaining_misses),
                 framesDone=index,
                 framesTotal=total,
                 currentFrameIndex=index,
                 currentFrameSeconds=frame_seconds,
                 currentOriginalUrl=media_url(frame),
                 currentEnhancedUrl=media_url(output),
-                latestFrameSeq=frame_event.seq,
+                latestFrameSeq=latest_frame_seq,
                 cacheHits=cache_hits,
                 cacheMisses=cache_misses_done,
             )
