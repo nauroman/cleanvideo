@@ -1,6 +1,18 @@
 const state = {
   video: null,
   jobTimer: null,
+  previewTimer: null,
+  previewInFlight: false,
+  previewDirty: false,
+  previewVersion: 0,
+  exportInFlight: false,
+};
+
+const resolutionPresets = {
+  preset_720p: 1280,
+  preset_fullhd: 1920,
+  preset_4k: 3840,
+  preset_8k: 7680,
 };
 
 const els = {
@@ -17,7 +29,6 @@ const els = {
   timeline: document.querySelector("#timeline"),
   currentTime: document.querySelector("#currentTime"),
   durationTime: document.querySelector("#durationTime"),
-  previewButton: document.querySelector("#previewButton"),
   exportButton: document.querySelector("#exportButton"),
   activityText: document.querySelector("#activityText"),
   jobProgress: document.querySelector("#jobProgress"),
@@ -71,7 +82,9 @@ async function api(path, options = {}) {
 }
 
 function collectSettings() {
-  const scaleBy = els.scaleBy.value;
+  const selectedScale = els.scaleBy.value;
+  const presetLongestSide = resolutionPresets[selectedScale] ?? null;
+  const scaleBy = presetLongestSide || selectedScale === "longest_side" ? "longest_side" : "factor";
   const patchSize = Number(els.patchSize.value);
   let stride = Number(els.stride.value);
   if (stride > patchSize) {
@@ -83,7 +96,7 @@ function collectSettings() {
     prompt: els.prompt.value,
     scaleBy,
     upscale: Number(els.upscale.value),
-    targetLongestSide: scaleBy === "longest_side" ? Number(els.targetLongestSide.value) : null,
+    targetLongestSide: scaleBy === "longest_side" ? presetLongestSide || Number(els.targetLongestSide.value) : null,
     patchSize,
     stride,
     seed: Number(els.seed.value),
@@ -92,9 +105,11 @@ function collectSettings() {
 }
 
 function updateScaleMode() {
-  const targetMode = els.scaleBy.value === "longest_side";
-  els.targetField.classList.toggle("hidden", !targetMode);
-  els.upscaleField.classList.toggle("hidden", targetMode);
+  const selectedScale = els.scaleBy.value;
+  const customTargetMode = selectedScale === "longest_side";
+  const fixedTargetMode = Boolean(resolutionPresets[selectedScale]);
+  els.targetField.classList.toggle("hidden", !customTargetMode);
+  els.upscaleField.classList.toggle("hidden", customTargetMode || fixedTargetMode);
 }
 
 function setVideo(record) {
@@ -112,10 +127,10 @@ function setVideo(record) {
   els.timeline.value = "0";
   els.currentTime.textContent = formatTime(0);
   els.durationTime.textContent = formatTime(meta.duration || 0);
-  els.previewButton.disabled = false;
   els.exportButton.disabled = false;
   els.downloadLink.hidden = true;
-  setActivity("Ready", 0);
+  setActivity("Preparing preview", 0.1);
+  scheduleAutoPreview({ delay: 200, reason: "new video" });
 }
 
 async function refreshStatus() {
@@ -143,11 +158,26 @@ async function uploadVideo(file) {
   setVideo(record);
 }
 
-async function previewFrame() {
+function setExportEnabled(enabled) {
+  els.exportButton.disabled = !enabled || !state.video || state.exportInFlight || state.previewInFlight;
+}
+
+function scheduleAutoPreview({ delay = 450, reason = "settings changed" } = {}) {
+  if (!state.video || state.exportInFlight) return;
+  state.previewDirty = true;
+  window.clearTimeout(state.previewTimer);
+  setActivity(`Preview queued: ${reason}`, 0.12);
+  state.previewTimer = window.setTimeout(runAutoPreview, delay);
+}
+
+async function runAutoPreview() {
   if (!state.video) return;
-  els.previewButton.disabled = true;
-  els.exportButton.disabled = true;
-  setActivity("Loading HYPIR and enhancing preview", 0.2);
+  if (state.previewInFlight) return;
+  state.previewDirty = false;
+  state.previewInFlight = true;
+  setExportEnabled(false);
+  const version = ++state.previewVersion;
+  setActivity("Enhancing preview", 0.2);
   try {
     const body = {
       videoId: state.video.id,
@@ -159,6 +189,7 @@ async function previewFrame() {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(body),
     });
+    if (version !== state.previewVersion || state.previewDirty) return;
     els.sourceVideo.hidden = true;
     els.originalPreview.src = `${preview.originalUrl}?t=${Date.now()}`;
     els.enhancedPreview.src = `${preview.enhancedUrl}?t=${Date.now()}`;
@@ -173,15 +204,20 @@ async function previewFrame() {
   } catch (error) {
     setActivity(`Preview failed: ${error.message}`, 0);
   } finally {
-    els.previewButton.disabled = false;
-    els.exportButton.disabled = false;
+    state.previewInFlight = false;
+    setExportEnabled(true);
+    if (state.previewDirty && !state.exportInFlight) {
+      scheduleAutoPreview({ delay: 50, reason: "latest change" });
+    }
   }
 }
 
 async function startExport() {
   if (!state.video) return;
-  els.previewButton.disabled = true;
-  els.exportButton.disabled = true;
+  window.clearTimeout(state.previewTimer);
+  state.exportInFlight = true;
+  state.previewDirty = false;
+  setExportEnabled(false);
   els.downloadLink.hidden = true;
   setActivity("Starting export", 0.02);
   try {
@@ -199,8 +235,8 @@ async function startExport() {
     pollJob(job.id);
   } catch (error) {
     setActivity(`Export failed: ${error.message}`, 0);
-    els.previewButton.disabled = false;
-    els.exportButton.disabled = false;
+    state.exportInFlight = false;
+    setExportEnabled(true);
   }
 }
 
@@ -215,23 +251,23 @@ function pollJob(jobId) {
         state.jobTimer = null;
         els.downloadLink.href = job.outputUrl;
         els.downloadLink.hidden = false;
-        els.previewButton.disabled = false;
-        els.exportButton.disabled = false;
+        state.exportInFlight = false;
+        setExportEnabled(true);
         await refreshStatus();
       }
       if (job.status === "error") {
         clearInterval(state.jobTimer);
         state.jobTimer = null;
         setActivity(`Export failed: ${job.error || job.message}`, 0);
-        els.previewButton.disabled = false;
-        els.exportButton.disabled = false;
+        state.exportInFlight = false;
+        setExportEnabled(true);
       }
     } catch (error) {
       clearInterval(state.jobTimer);
       state.jobTimer = null;
       setActivity(`Job polling failed: ${error.message}`, 0);
-      els.previewButton.disabled = false;
-      els.exportButton.disabled = false;
+      state.exportInFlight = false;
+      setExportEnabled(true);
     }
   }, 1600);
 }
@@ -251,6 +287,7 @@ els.timeline.addEventListener("input", () => {
   els.currentTime.textContent = formatTime(seconds);
   if (state.video) {
     els.sourceVideo.currentTime = seconds;
+    scheduleAutoPreview({ delay: 500, reason: "playhead moved" });
   }
 });
 
@@ -263,16 +300,37 @@ els.sourceVideo.addEventListener("timeupdate", () => {
   }
 });
 
-els.previewButton.addEventListener("click", previewFrame);
+els.sourceVideo.addEventListener("seeked", () => {
+  if (!state.video || document.activeElement === els.timeline) return;
+  const seconds = els.sourceVideo.currentTime;
+  if (Number.isFinite(seconds)) {
+    els.timeline.value = String(seconds);
+    els.currentTime.textContent = formatTime(seconds);
+    scheduleAutoPreview({ delay: 300, reason: "playhead moved" });
+  }
+});
+
 els.exportButton.addEventListener("click", startExport);
 els.refreshStatusButton.addEventListener("click", refreshStatus);
-els.scaleBy.addEventListener("change", updateScaleMode);
-els.patchSize.addEventListener("change", collectSettings);
-els.stride.addEventListener("change", collectSettings);
+els.scaleBy.addEventListener("change", () => {
+  updateScaleMode();
+  scheduleAutoPreview();
+});
+els.upscale.addEventListener("change", () => scheduleAutoPreview());
+els.targetLongestSide.addEventListener("input", () => scheduleAutoPreview());
+els.patchSize.addEventListener("change", () => {
+  collectSettings();
+  scheduleAutoPreview();
+});
+els.stride.addEventListener("change", () => {
+  collectSettings();
+  scheduleAutoPreview();
+});
+els.seed.addEventListener("input", () => scheduleAutoPreview());
+els.prompt.addEventListener("input", () => scheduleAutoPreview());
 els.crf.addEventListener("input", () => {
   els.crfValue.textContent = els.crf.value;
 });
 
 updateScaleMode();
 refreshStatus();
-
