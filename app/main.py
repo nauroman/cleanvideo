@@ -4,6 +4,7 @@ import json
 import hashlib
 import os
 import shutil
+import stat
 import subprocess
 import sys
 import threading
@@ -43,7 +44,7 @@ CACHE_DIR = WORK_DIR / "cache"
 for directory in [UPLOAD_DIR, PREVIEW_DIR, EXPORT_DIR, JOB_DIR, CACHE_DIR]:
     directory.mkdir(parents=True, exist_ok=True)
 GENERATED_DIRS = [PREVIEW_DIR, CACHE_DIR, JOB_DIR, EXPORT_DIR]
-APP_BUILD = "2026-06-11-half-upscale-v1"
+APP_BUILD = "2026-06-11-clean-all-verify-v1"
 
 
 class ProcessSettings(BaseModel):
@@ -302,26 +303,41 @@ def ensure_work_path(path: Path) -> None:
 
 def path_usage(path: Path) -> dict:
     if not path.exists():
-        return {"files": 0, "bytes": 0}
+        return {"files": 0, "dirs": 0, "bytes": 0}
     if path.is_file():
-        return {"files": 1, "bytes": path.stat().st_size}
+        return {"files": 1, "dirs": 0, "bytes": path.stat().st_size}
     files = 0
+    dirs = 0
     bytes_used = 0
     for child in path.rglob("*"):
         if child.is_file():
             files += 1
             bytes_used += child.stat().st_size
-    return {"files": files, "bytes": bytes_used}
+        elif child.is_dir():
+            dirs += 1
+    return {"files": files, "dirs": dirs, "bytes": bytes_used}
+
+
+def handle_remove_readonly(func, failed_path, _exc_info) -> None:
+    try:
+        os.chmod(failed_path, stat.S_IWRITE)
+        func(failed_path)
+    except FileNotFoundError:
+        pass
 
 
 def remove_generated_path(path: Path, *, recreate: bool) -> dict:
     ensure_work_path(path)
     usage = path_usage(path)
-    if path.exists():
-        if path.is_file():
-            path.unlink()
-        else:
-            shutil.rmtree(path)
+    try:
+        if path.exists():
+            if path.is_file():
+                os.chmod(path, stat.S_IWRITE)
+                path.unlink()
+            else:
+                shutil.rmtree(path, onerror=handle_remove_readonly)
+    except FileNotFoundError:
+        pass
     if recreate:
         path.mkdir(parents=True, exist_ok=True)
     return usage
@@ -344,17 +360,32 @@ def schedule_generated_path_cleanup(path: Path, delay_seconds: int = 120) -> dic
 
 def clear_generated_dirs() -> dict:
     total_files = 0
+    total_dirs = 0
     total_bytes = 0
     cleaned: dict[str, dict] = {}
     for directory in GENERATED_DIRS:
         usage = remove_generated_path(directory, recreate=True)
         cleaned[directory.name] = usage
         total_files += usage["files"]
+        total_dirs += usage["dirs"]
         total_bytes += usage["bytes"]
+    remaining = {
+        directory.name: usage
+        for directory in GENERATED_DIRS
+        if (usage := path_usage(directory))["files"] or usage["dirs"]
+    }
+    if remaining:
+        details = ", ".join(
+            f"{name}: {usage['dirs']} dirs, {usage['files']} files"
+            for name, usage in remaining.items()
+        )
+        raise RuntimeError(f"Cleanup incomplete. Remaining generated data: {details}")
     return {
         "cleaned": cleaned,
         "filesDeleted": total_files,
+        "directoriesDeleted": total_dirs,
         "bytesFreed": total_bytes,
+        "verifiedEmpty": True,
         "uploadsPreserved": True,
     }
 

@@ -536,7 +536,7 @@ async function openOutputFolder() {
 async function clearGeneratedFiles() {
   if (state.exportInFlight || state.previewInFlight) return;
   const confirmed = window.confirm(
-    "Delete all generated videos, preview images, cached frames, and job files? Source uploads will stay."
+    "Delete all generated videos, preview images, cache files, and job records? Source uploads will stay."
   );
   if (!confirmed) return;
 
@@ -548,7 +548,7 @@ async function clearGeneratedFiles() {
     const result = await api("/api/cleanup-generated", { method: "POST" });
     resetGeneratedUi();
     setActivity(
-      `Cleaned ${result.filesDeleted} generated files (${formatBytes(result.bytesFreed)} freed). Source uploads preserved.`,
+      `Cleaned all generated/cache data: ${result.filesDeleted} files and ${result.directoriesDeleted} folders (${formatBytes(result.bytesFreed)} freed). Source uploads preserved.`,
       0
     );
     await refreshStatus();
