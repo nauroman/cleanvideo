@@ -20,6 +20,8 @@ Open <http://127.0.0.1:8765>.
 
 The app uses PyTorch CUDA for HYPIR inference and `h264_nvenc` for H.264 export when available. If NVENC fails, the backend falls back to `libx264`.
 
+During export, enhanced frames are cached under `work/cache` using the selected video and HYPIR settings. If the app is stopped mid-export, starting the same export again reuses already enhanced frames instead of generating them again. The browser also stores the last selected server-side video id and UI settings in `localStorage`.
+
 ## Reinstall dependencies
 
 ```powershell

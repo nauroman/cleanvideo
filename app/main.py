@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import shutil
 import threading
+import time
 import traceback
 import uuid
 from datetime import datetime
@@ -12,6 +14,7 @@ from typing import Literal
 from fastapi import BackgroundTasks, FastAPI, File, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
+from PIL import Image
 from pydantic import BaseModel, Field
 
 from .hypir_engine import HypirSettings, engine
@@ -32,7 +35,8 @@ UPLOAD_DIR = WORK_DIR / "uploads"
 PREVIEW_DIR = WORK_DIR / "previews"
 EXPORT_DIR = WORK_DIR / "exports"
 JOB_DIR = WORK_DIR / "jobs"
-for directory in [UPLOAD_DIR, PREVIEW_DIR, EXPORT_DIR, JOB_DIR]:
+CACHE_DIR = WORK_DIR / "cache"
+for directory in [UPLOAD_DIR, PREVIEW_DIR, EXPORT_DIR, JOB_DIR, CACHE_DIR]:
     directory.mkdir(parents=True, exist_ok=True)
 
 
@@ -74,9 +78,19 @@ class ExportRequest(ProcessSettings):
 class JobState(BaseModel):
     id: str
     kind: str
-    status: Literal["queued", "running", "done", "error"]
+    status: Literal["queued", "running", "done", "error", "cancelled"]
     progress: float
     message: str
+    etaSeconds: float | None = None
+    framesDone: int = 0
+    framesTotal: int = 0
+    currentFrameIndex: int | None = None
+    currentFrameSeconds: float | None = None
+    currentOriginalUrl: str | None = None
+    currentEnhancedUrl: str | None = None
+    cacheKey: str | None = None
+    cacheHits: int = 0
+    cacheMisses: int = 0
     outputUrl: str | None = None
     outputPath: str | None = None
     error: str | None = None
@@ -96,6 +110,7 @@ app.add_middleware(
 videos: dict[str, dict] = {}
 jobs: dict[str, JobState] = {}
 jobs_lock = threading.Lock()
+cancelled_jobs: set[str] = set()
 
 
 def now_iso() -> str:
@@ -134,6 +149,81 @@ def update_job(job_id: str, **changes) -> None:
         data.update(changes)
         data["updatedAt"] = now_iso()
         jobs[job_id] = JobState(**data)
+
+
+def media_url(path: Path) -> str:
+    return f"/media/{path.relative_to(WORK_DIR).as_posix()}"
+
+
+def valid_image(path: Path) -> bool:
+    if not path.exists() or path.stat().st_size == 0:
+        return False
+    try:
+        with Image.open(path) as img:
+            img.verify()
+        return True
+    except Exception:
+        return False
+
+
+def video_fingerprint(record: dict) -> dict:
+    path = Path(record["path"])
+    stat = path.stat()
+    return {
+        "id": record["id"],
+        "name": record["name"],
+        "size": stat.st_size,
+        "mtimeNs": stat.st_mtime_ns,
+        "metadata": record["metadata"],
+    }
+
+
+def enhancement_settings(request: ExportRequest) -> dict:
+    return request.model_dump(exclude={"crf", "encoder"}, mode="json")
+
+
+def enhancement_cache_key(record: dict, request: ExportRequest) -> str:
+    payload = {
+        "engineVersion": "hypir-sd2-v1",
+        "video": video_fingerprint(record),
+        "settings": enhancement_settings(request),
+    }
+    raw = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(raw).hexdigest()
+
+
+def export_output_path(record: dict, cache_key: str, request: ExportRequest) -> Path:
+    payload = {"cacheKey": cache_key, "crf": request.crf, "encoder": request.encoder}
+    suffix = hashlib.sha256(json.dumps(payload, sort_keys=True).encode("utf-8")).hexdigest()[:8]
+    output_name = f"{Path(record['name']).stem}_hypir_h264_{cache_key[:8]}_q{request.crf}_{suffix}.mp4"
+    return EXPORT_DIR / safe_name(output_name)
+
+
+def write_cache_manifest(cache_root: Path, record: dict, request: ExportRequest, status: str) -> None:
+    manifest = {
+        "status": status,
+        "updatedAt": now_iso(),
+        "video": video_fingerprint(record),
+        "settings": enhancement_settings(request),
+    }
+    cache_root.mkdir(parents=True, exist_ok=True)
+    (cache_root / "manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+
+
+def reusable_frames(video_path: Path, frames_dir: Path, expected_count: int) -> list[Path]:
+    frames = sorted(frames_dir.glob("frame_*.png"))
+    if frames and (expected_count <= 0 or len(frames) == expected_count):
+        return frames
+    return extract_frames(video_path, frames_dir)
+
+
+def eta_seconds(started: float, completed_misses: int, remaining_misses: int) -> float | None:
+    if remaining_misses <= 0:
+        return 0.0
+    if completed_misses <= 0:
+        return None
+    elapsed = max(0.0, time.monotonic() - started)
+    return elapsed / completed_misses * remaining_misses
 
 
 @app.on_event("startup")
@@ -213,41 +303,115 @@ def run_export(job_id: str, request: ExportRequest) -> None:
         record = get_video(request.videoId)
         source = Path(record["path"])
         metadata = record["metadata"]
-        job_root = JOB_DIR / job_id
-        raw_frames = job_root / "frames"
-        enhanced_frames = job_root / "enhanced"
+        cache_key = enhancement_cache_key(record, request)
+        cache_root = CACHE_DIR / cache_key
+        raw_frames = cache_root / "frames"
+        enhanced_frames = cache_root / "enhanced"
         enhanced_frames.mkdir(parents=True, exist_ok=True)
+        write_cache_manifest(cache_root, record, request, "running")
 
-        update_job(job_id, status="running", progress=0.02, message="Extracting frames with ffmpeg")
-        frames = extract_frames(source, raw_frames)
+        update_job(
+            job_id,
+            status="running",
+            progress=0.02,
+            message="Preparing source frames",
+            cacheKey=cache_key,
+        )
+        if job_id in cancelled_jobs:
+            update_job(job_id, status="cancelled", progress=0, message="Stopped before export started")
+            cancelled_jobs.discard(job_id)
+            return
+
+        expected_count = int(metadata.get("frameCount") or 0)
+        frames = reusable_frames(source, raw_frames, expected_count)
         total = len(frames)
+        fps = float(metadata.get("fps") or 30.0)
         settings = request.to_hypir()
+        outputs = [(frame, enhanced_frames / frame.name) for frame in frames]
+        missing_total = sum(1 for _, output in outputs if not valid_image(output))
+        cache_hits = total - missing_total
+        cache_misses_done = 0
+        started = time.monotonic()
 
-        for index, frame in enumerate(frames, start=1):
-            output = enhanced_frames / frame.name
+        for index, (frame, output) in enumerate(outputs, start=1):
+            if job_id in cancelled_jobs:
+                write_cache_manifest(cache_root, record, request, "cancelled")
+                update_job(
+                    job_id,
+                    status="cancelled",
+                    progress=0.05 + (index - 1) / max(total, 1) * 0.84,
+                    message=f"Stopped. Cached {index - 1} / {total} enhanced frames.",
+                    framesDone=index - 1,
+                    framesTotal=total,
+                    etaSeconds=None,
+                )
+                cancelled_jobs.discard(job_id)
+                return
+
+            cached = valid_image(output)
+            remaining_misses = max(0, missing_total - cache_misses_done)
             update_job(
                 job_id,
                 progress=0.05 + (index - 1) / max(total, 1) * 0.84,
-                message=f"Enhancing frame {index} / {total}",
+                message=(
+                    f"Using cached frame {index} / {total}"
+                    if cached else f"Enhancing frame {index} / {total}"
+                ),
+                etaSeconds=eta_seconds(started, cache_misses_done, remaining_misses),
+                framesDone=index - 1,
+                framesTotal=total,
+                currentFrameIndex=index,
+                currentFrameSeconds=(index - 1) / fps,
+                currentOriginalUrl=media_url(frame),
+                currentEnhancedUrl=media_url(output) if cached else None,
+                cacheHits=cache_hits,
+                cacheMisses=cache_misses_done,
             )
-            engine.enhance_file(frame, output, settings)
+            if cached:
+                pass
+            else:
+                engine.enhance_file(frame, output, settings)
+                cache_misses_done += 1
 
-        output_name = f"{Path(record['name']).stem}_hypir_h264_{job_id[:8]}.mp4"
-        output_path = EXPORT_DIR / safe_name(output_name)
-        update_job(job_id, progress=0.92, message="Encoding H.264 video")
-        selected_encoder = encode_video(
-            enhanced_frames,
-            source,
-            output_path,
-            fps=float(metadata.get("fps") or 30.0),
-            crf=request.crf,
-            encoder=request.encoder,
-        )
+            remaining_misses = max(0, missing_total - cache_misses_done)
+            update_job(
+                job_id,
+                progress=0.05 + index / max(total, 1) * 0.84,
+                message=f"Frame {index} / {total} ready",
+                etaSeconds=eta_seconds(started, cache_misses_done, remaining_misses),
+                framesDone=index,
+                framesTotal=total,
+                currentFrameIndex=index,
+                currentFrameSeconds=(index - 1) / fps,
+                currentOriginalUrl=media_url(frame),
+                currentEnhancedUrl=media_url(output),
+                cacheHits=cache_hits,
+                cacheMisses=cache_misses_done,
+            )
+
+        write_cache_manifest(cache_root, record, request, "complete")
+        output_path = export_output_path(record, cache_key, request)
+        if output_path.exists() and output_path.stat().st_size > 0:
+            selected_encoder = "cached H.264"
+            update_job(job_id, progress=0.96, message="Using cached H.264 output", etaSeconds=0)
+        else:
+            update_job(job_id, progress=0.92, message="Encoding H.264 video", etaSeconds=None)
+            selected_encoder = encode_video(
+                enhanced_frames,
+                source,
+                output_path,
+                fps=fps,
+                crf=request.crf,
+                encoder=request.encoder,
+            )
         update_job(
             job_id,
             status="done",
             progress=1.0,
             message=f"Done. Encoded with {selected_encoder}",
+            etaSeconds=0,
+            framesDone=total,
+            framesTotal=total,
             outputUrl=f"/media/exports/{output_path.name}",
             outputPath=str(output_path),
         )
@@ -257,8 +421,11 @@ def run_export(job_id: str, request: ExportRequest) -> None:
             status="error",
             progress=0,
             message="Export failed",
+            etaSeconds=None,
             error=f"{exc}\n{traceback.format_exc()}",
         )
+    finally:
+        cancelled_jobs.discard(job_id)
 
 
 @app.post("/api/export")
@@ -287,6 +454,17 @@ def get_job(job_id: str) -> dict:
     return job.model_dump()
 
 
+@app.post("/api/jobs/{job_id}/cancel")
+def cancel_job(job_id: str) -> dict:
+    job = jobs.get(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+    if job.status in {"done", "error", "cancelled"}:
+        return job.model_dump()
+    cancelled_jobs.add(job_id)
+    update_job(job_id, message="Stopping after the current frame")
+    return jobs[job_id].model_dump()
+
+
 app.mount("/media", StaticFiles(directory=WORK_DIR), name="media")
 app.mount("/", StaticFiles(directory=STATIC_DIR, html=True), name="static")
-

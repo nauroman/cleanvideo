@@ -1,12 +1,17 @@
 const state = {
   video: null,
   jobTimer: null,
+  currentJobId: null,
   previewTimer: null,
   previewInFlight: false,
   previewDirty: false,
   previewVersion: 0,
   exportInFlight: false,
+  liveOriginalUrl: null,
+  liveEnhancedUrl: null,
 };
+
+const settingsStorageKey = "cleanvideo.session.v1";
 
 const resolutionPresets = {
   preset_720p: 1280,
@@ -30,7 +35,10 @@ const els = {
   currentTime: document.querySelector("#currentTime"),
   durationTime: document.querySelector("#durationTime"),
   exportButton: document.querySelector("#exportButton"),
+  cancelExportButton: document.querySelector("#cancelExportButton"),
   activityText: document.querySelector("#activityText"),
+  frameProgressText: document.querySelector("#frameProgressText"),
+  etaText: document.querySelector("#etaText"),
   jobProgress: document.querySelector("#jobProgress"),
   downloadLink: document.querySelector("#downloadLink"),
   refreshStatusButton: document.querySelector("#refreshStatusButton"),
@@ -59,11 +67,77 @@ function formatTime(seconds) {
   return `${String(minutes).padStart(2, "0")}:${String(secs).padStart(2, "0")}.${String(ms).padStart(3, "0")}`;
 }
 
+function formatDuration(seconds) {
+  if (!Number.isFinite(seconds)) return "--";
+  const safe = Math.max(0, Math.round(seconds));
+  const hours = Math.floor(safe / 3600);
+  const minutes = Math.floor((safe % 3600) / 60);
+  const secs = safe % 60;
+  if (hours > 0) {
+    return `${hours}h ${String(minutes).padStart(2, "0")}m`;
+  }
+  if (minutes > 0) {
+    return `${minutes}m ${String(secs).padStart(2, "0")}s`;
+  }
+  return `${secs}s`;
+}
+
 function setActivity(message, progress = null) {
   els.activityText.textContent = message;
   if (progress !== null) {
     els.jobProgress.style.width = `${Math.max(0, Math.min(1, progress)) * 100}%`;
   }
+}
+
+function collectUiSettings() {
+  return {
+    scaleBy: els.scaleBy.value,
+    upscale: els.upscale.value,
+    targetLongestSide: els.targetLongestSide.value,
+    patchSize: els.patchSize.value,
+    stride: els.stride.value,
+    seed: els.seed.value,
+    prompt: els.prompt.value,
+    encoder: els.encoder.value,
+    crf: els.crf.value,
+  };
+}
+
+function saveLocalState() {
+  const payload = {
+    settings: collectUiSettings(),
+    videoId: state.video?.id ?? null,
+  };
+  localStorage.setItem(settingsStorageKey, JSON.stringify(payload));
+}
+
+function readLocalState() {
+  try {
+    return JSON.parse(localStorage.getItem(settingsStorageKey) || "{}");
+  } catch {
+    return {};
+  }
+}
+
+function applySavedSettings(settings = {}) {
+  const entries = [
+    ["scaleBy", els.scaleBy],
+    ["upscale", els.upscale],
+    ["targetLongestSide", els.targetLongestSide],
+    ["patchSize", els.patchSize],
+    ["stride", els.stride],
+    ["seed", els.seed],
+    ["prompt", els.prompt],
+    ["encoder", els.encoder],
+    ["crf", els.crf],
+  ];
+  for (const [key, element] of entries) {
+    if (settings[key] !== undefined && element) {
+      element.value = settings[key];
+    }
+  }
+  els.crfValue.textContent = els.crf.value;
+  updateScaleMode();
 }
 
 async function api(path, options = {}) {
@@ -112,8 +186,10 @@ function updateScaleMode() {
   els.upscaleField.classList.toggle("hidden", customTargetMode || fixedTargetMode);
 }
 
-function setVideo(record) {
+function setVideo(record, { persist = true } = {}) {
   state.video = record;
+  state.liveOriginalUrl = null;
+  state.liveEnhancedUrl = null;
   const meta = record.metadata;
   els.videoName.textContent = record.name;
   els.videoMeta.textContent = `${meta.width}x${meta.height} | ${meta.fps.toFixed(3)} fps | ${formatTime(meta.duration)} | ${meta.codec || "video"}`;
@@ -127,10 +203,28 @@ function setVideo(record) {
   els.timeline.value = "0";
   els.currentTime.textContent = formatTime(0);
   els.durationTime.textContent = formatTime(meta.duration || 0);
-  els.exportButton.disabled = false;
+  els.frameProgressText.textContent = "Frames: --";
+  els.etaText.textContent = "ETA: --";
+  setExportEnabled(true);
   els.downloadLink.hidden = true;
+  if (persist) saveLocalState();
   setActivity("Preparing preview", 0.1);
   scheduleAutoPreview({ delay: 200, reason: "new video" });
+}
+
+async function restoreSession() {
+  const saved = readLocalState();
+  applySavedSettings(saved.settings);
+  if (!saved.videoId) return;
+  try {
+    const result = await api("/api/videos");
+    const record = result.videos.find((video) => video.id === saved.videoId);
+    if (record) {
+      setVideo(record, { persist: false });
+    }
+  } catch (error) {
+    setActivity(`Could not restore last video: ${error.message}`, 0);
+  }
 }
 
 async function refreshStatus() {
@@ -160,6 +254,8 @@ async function uploadVideo(file) {
 
 function setExportEnabled(enabled) {
   els.exportButton.disabled = !enabled || !state.video || state.exportInFlight || state.previewInFlight;
+  els.cancelExportButton.hidden = !state.exportInFlight;
+  els.cancelExportButton.disabled = !state.exportInFlight;
 }
 
 function scheduleAutoPreview({ delay = 450, reason = "settings changed" } = {}) {
@@ -218,7 +314,10 @@ async function startExport() {
   state.exportInFlight = true;
   state.previewDirty = false;
   setExportEnabled(false);
+  saveLocalState();
   els.downloadLink.hidden = true;
+  els.frameProgressText.textContent = "Frames: preparing";
+  els.etaText.textContent = "ETA: estimating";
   setActivity("Starting export", 0.02);
   try {
     const body = {
@@ -232,6 +331,7 @@ async function startExport() {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(body),
     });
+    state.currentJobId = job.id;
     pollJob(job.id);
   } catch (error) {
     setActivity(`Export failed: ${error.message}`, 0);
@@ -240,26 +340,81 @@ async function startExport() {
   }
 }
 
+async function cancelExport() {
+  if (!state.currentJobId) return;
+  els.cancelExportButton.disabled = true;
+  setActivity("Stopping after the current frame", null);
+  try {
+    await api(`/api/jobs/${state.currentJobId}/cancel`, { method: "POST" });
+  } catch (error) {
+    setActivity(`Stop failed: ${error.message}`, null);
+    els.cancelExportButton.disabled = false;
+  }
+}
+
+function updateLiveFrame(job) {
+  if (!job.currentOriginalUrl || !job.currentEnhancedUrl) return;
+  const originalUrl = `${job.currentOriginalUrl}?t=${job.updatedAt}`;
+  const enhancedUrl = `${job.currentEnhancedUrl}?t=${job.updatedAt}`;
+  if (state.liveOriginalUrl !== originalUrl) {
+    els.originalPreview.src = originalUrl;
+    state.liveOriginalUrl = originalUrl;
+  }
+  if (state.liveEnhancedUrl !== enhancedUrl) {
+    els.enhancedPreview.src = enhancedUrl;
+    state.liveEnhancedUrl = enhancedUrl;
+  }
+  els.sourceVideo.hidden = true;
+  els.originalPreview.hidden = false;
+  els.enhancedPreview.hidden = false;
+  els.originalEmpty.hidden = true;
+  els.enhancedEmpty.hidden = true;
+  if (Number.isFinite(job.currentFrameSeconds)) {
+    els.timeline.value = String(job.currentFrameSeconds);
+    els.currentTime.textContent = formatTime(job.currentFrameSeconds);
+  }
+  els.originalInfo.textContent = job.currentFrameIndex
+    ? `frame ${job.currentFrameIndex}`
+    : "source frame";
+  els.enhancedInfo.textContent = job.framesTotal
+    ? `frame ${job.currentFrameIndex} / ${job.framesTotal}`
+    : "enhanced frame";
+}
+
+function updateJobUi(job) {
+  setActivity(job.message, job.progress);
+  if (job.framesTotal) {
+    const cached = job.cacheHits ? ` | cached ${job.cacheHits}` : "";
+    els.frameProgressText.textContent = `Frames: ${job.framesDone} / ${job.framesTotal}${cached}`;
+  } else {
+    els.frameProgressText.textContent = "Frames: preparing";
+  }
+  els.etaText.textContent = `ETA: ${formatDuration(job.etaSeconds)}`;
+  updateLiveFrame(job);
+}
+
 function pollJob(jobId) {
   if (state.jobTimer) clearInterval(state.jobTimer);
   state.jobTimer = setInterval(async () => {
     try {
       const job = await api(`/api/jobs/${jobId}`);
-      setActivity(job.message, job.progress);
+      updateJobUi(job);
       if (job.status === "done") {
         clearInterval(state.jobTimer);
         state.jobTimer = null;
         els.downloadLink.href = job.outputUrl;
         els.downloadLink.hidden = false;
         state.exportInFlight = false;
+        state.currentJobId = null;
         setExportEnabled(true);
         await refreshStatus();
       }
-      if (job.status === "error") {
+      if (job.status === "error" || job.status === "cancelled") {
         clearInterval(state.jobTimer);
         state.jobTimer = null;
-        setActivity(`Export failed: ${job.error || job.message}`, 0);
+        setActivity(job.status === "cancelled" ? job.message : `Export failed: ${job.error || job.message}`, job.progress);
         state.exportInFlight = false;
+        state.currentJobId = null;
         setExportEnabled(true);
       }
     } catch (error) {
@@ -267,9 +422,10 @@ function pollJob(jobId) {
       state.jobTimer = null;
       setActivity(`Job polling failed: ${error.message}`, 0);
       state.exportInFlight = false;
+      state.currentJobId = null;
       setExportEnabled(true);
     }
-  }, 1600);
+  }, 700);
 }
 
 els.videoInput.addEventListener("change", async (event) => {
@@ -311,26 +467,45 @@ els.sourceVideo.addEventListener("seeked", () => {
 });
 
 els.exportButton.addEventListener("click", startExport);
+els.cancelExportButton.addEventListener("click", cancelExport);
 els.refreshStatusButton.addEventListener("click", refreshStatus);
 els.scaleBy.addEventListener("change", () => {
   updateScaleMode();
+  saveLocalState();
   scheduleAutoPreview();
 });
-els.upscale.addEventListener("change", () => scheduleAutoPreview());
-els.targetLongestSide.addEventListener("input", () => scheduleAutoPreview());
+els.upscale.addEventListener("change", () => {
+  saveLocalState();
+  scheduleAutoPreview();
+});
+els.targetLongestSide.addEventListener("input", () => {
+  saveLocalState();
+  scheduleAutoPreview();
+});
 els.patchSize.addEventListener("change", () => {
   collectSettings();
+  saveLocalState();
   scheduleAutoPreview();
 });
 els.stride.addEventListener("change", () => {
   collectSettings();
+  saveLocalState();
   scheduleAutoPreview();
 });
-els.seed.addEventListener("input", () => scheduleAutoPreview());
-els.prompt.addEventListener("input", () => scheduleAutoPreview());
+els.seed.addEventListener("input", () => {
+  saveLocalState();
+  scheduleAutoPreview();
+});
+els.prompt.addEventListener("input", () => {
+  saveLocalState();
+  scheduleAutoPreview();
+});
+els.encoder.addEventListener("change", saveLocalState);
 els.crf.addEventListener("input", () => {
   els.crfValue.textContent = els.crf.value;
+  saveLocalState();
 });
 
 updateScaleMode();
 refreshStatus();
+restoreSession();

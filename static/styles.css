@@ -211,7 +211,8 @@ button {
 
 .file-button span,
 .primary-button,
-.secondary-button {
+.secondary-button,
+.danger-button {
   display: inline-flex;
   align-items: center;
   justify-content: center;
@@ -236,12 +237,14 @@ button {
 }
 
 .primary-button,
-.secondary-button {
+.secondary-button,
+.danger-button {
   padding: 0 14px;
 }
 
 .primary-button:disabled,
-.secondary-button:disabled {
+.secondary-button:disabled,
+.danger-button:disabled {
   cursor: not-allowed;
   opacity: 0.44;
 }
@@ -250,6 +253,12 @@ button {
   border-color: var(--line-strong);
   background: var(--panel-2);
   color: var(--muted);
+}
+
+.danger-button {
+  border: 1px solid rgba(255, 131, 111, 0.42);
+  background: rgba(255, 131, 111, 0.12);
+  color: #ffc4ba;
 }
 
 .video-title {
@@ -405,6 +414,22 @@ svg {
   white-space: nowrap;
 }
 
+.progress-meta {
+  display: flex;
+  justify-content: space-between;
+  gap: 14px;
+  margin-top: 10px;
+  color: var(--muted);
+  font-family: "SFMono-Regular", Consolas, monospace;
+  font-size: 12px;
+}
+
+.progress-meta span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .progress-wrap {
   height: 5px;
   margin-top: 12px;
@@ -444,6 +469,62 @@ svg {
   color: var(--muted);
   font-size: 12px;
   font-weight: 650;
+}
+
+.field-label {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  width: fit-content;
+  gap: 6px;
+}
+
+.help-button {
+  display: inline-grid;
+  width: 17px;
+  height: 17px;
+  place-items: center;
+  border: 1px solid var(--line-strong);
+  border-radius: 50%;
+  background: #111315;
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 800;
+  line-height: 1;
+  padding: 0;
+}
+
+.help-button::after {
+  position: absolute;
+  z-index: 20;
+  top: calc(100% + 8px);
+  left: 0;
+  display: none;
+  width: min(260px, calc(100vw - 44px));
+  padding: 10px 11px;
+  border: 1px solid #4b5156;
+  border-radius: 8px;
+  background: #0f1112;
+  box-shadow: 0 14px 40px rgba(0, 0, 0, 0.42);
+  color: var(--text);
+  content: attr(data-tooltip);
+  font-size: 12px;
+  font-weight: 560;
+  line-height: 1.45;
+  text-transform: none;
+  white-space: normal;
+}
+
+.help-button:hover,
+.help-button:focus-visible {
+  border-color: var(--accent);
+  color: var(--accent);
+  outline: none;
+}
+
+.help-button:hover::after,
+.help-button:focus-visible::after {
+  display: block;
 }
 
 .field:last-child {
@@ -562,7 +643,8 @@ svg {
   }
 
   .primary-button,
-  .secondary-button {
+  .secondary-button,
+  .danger-button {
     flex: 1 1 150px;
   }
 }

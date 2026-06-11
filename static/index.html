@@ -101,7 +101,15 @@
               <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3v12M7 10l5 5 5-5M5 21h14"/></svg>
               Export Video
             </button>
+            <button id="cancelExportButton" class="danger-button" type="button" hidden>
+              <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 6l12 12M18 6 6 18"/></svg>
+              Stop Export
+            </button>
             <span id="activityText">Idle</span>
+          </div>
+          <div class="progress-meta">
+            <span id="frameProgressText">Frames: --</span>
+            <span id="etaText">ETA: --</span>
           </div>
           <div class="progress-wrap">
             <div id="jobProgress" class="progress-bar"></div>
@@ -114,7 +122,15 @@
         <section class="panel">
           <h2>Resolution</h2>
           <label class="field">
-            <span>Scale Mode</span>
+            <span class="field-label">
+              Scale Mode
+              <button
+                class="help-button"
+                type="button"
+                aria-label="Scale Mode help"
+                data-tooltip="Choose the output size. Scale factor multiplies the video dimensions, while 720p, Full HD, 4K, and 8K resize the longest side to a standard target and keep the original aspect ratio. Example: a 1920x1080 video with 4K becomes about 3840x2160."
+              >?</button>
+            </span>
             <select id="scaleBy">
               <option value="factor">Scale factor</option>
               <option value="preset_720p">720p</option>
@@ -125,7 +141,15 @@
             </select>
           </label>
           <label id="upscaleField" class="field">
-            <span>Upscale</span>
+            <span class="field-label">
+              Upscale
+              <button
+                class="help-button"
+                type="button"
+                aria-label="Upscale help"
+                data-tooltip="Multiplies the original width and height. 1x keeps the same resolution, 2x doubles both dimensions, and 4x makes each frame much larger. Higher values take much longer and use more VRAM."
+              >?</button>
+            </span>
             <select id="upscale">
               <option value="1">1x</option>
               <option value="2">2x</option>
@@ -134,7 +158,15 @@
             </select>
           </label>
           <label id="targetField" class="field hidden">
-            <span>Longest Side</span>
+            <span class="field-label">
+              Longest Side
+              <button
+                class="help-button"
+                type="button"
+                aria-label="Longest Side help"
+                data-tooltip="Sets the longest edge of the output frame while preserving aspect ratio. Example: 1920 makes landscape video close to 1920x1080 and portrait video close to 1080x1920."
+              >?</button>
+            </span>
             <input id="targetLongestSide" type="number" min="256" max="8192" step="64" value="1920" />
           </label>
         </section>
@@ -142,7 +174,15 @@
         <section class="panel">
           <h2>HYPIR Quality</h2>
           <label class="field">
-            <span>Patch Size</span>
+            <span class="field-label">
+              Patch Size
+              <button
+                class="help-button"
+                type="button"
+                aria-label="Patch Size help"
+                data-tooltip="The tile size HYPIR processes at one time. 512 is safest and uses less VRAM. 768 or 1024 can improve consistency on large frames but may be slower or run out of GPU memory."
+              >?</button>
+            </span>
             <select id="patchSize">
               <option value="512">512</option>
               <option value="768">768</option>
@@ -150,7 +190,15 @@
             </select>
           </label>
           <label class="field">
-            <span>Stride</span>
+            <span class="field-label">
+              Stride
+              <button
+                class="help-button"
+                type="button"
+                aria-label="Stride help"
+                data-tooltip="How far the tile moves before HYPIR processes the next tile. Smaller stride means more overlap, fewer tile seams, and slower export. Larger stride is faster but can make tile boundaries more visible. A good starting point is half the patch size, such as 512 patch with 256 stride."
+              >?</button>
+            </span>
             <select id="stride">
               <option value="256">256</option>
               <option value="384">384</option>
@@ -159,11 +207,27 @@
             </select>
           </label>
           <label class="field">
-            <span>Seed</span>
+            <span class="field-label">
+              Seed
+              <button
+                class="help-button"
+                type="button"
+                aria-label="Seed help"
+                data-tooltip="The random number used by the AI. Keep the same seed to make previews and exports repeatable. Change it if the result looks strange and you want a different interpretation. Use -1 for a random seed."
+              >?</button>
+            </span>
             <input id="seed" type="number" value="231" />
           </label>
           <label class="field">
-            <span>Prompt</span>
+            <span class="field-label">
+              Prompt
+              <button
+                class="help-button"
+                type="button"
+                aria-label="Prompt help"
+                data-tooltip="A short description of the look you want. Keep it simple and visual. Examples: 'natural film detail, clean faces, sharp edges' or 'anime frame, clean line art, crisp texture'. Avoid asking for content that is not already in the video."
+              >?</button>
+            </span>
             <textarea id="prompt" rows="4" spellcheck="false">high quality, sharp details, natural texture</textarea>
           </label>
         </section>
@@ -171,7 +235,15 @@
         <section class="panel">
           <h2>H.264 Export</h2>
           <label class="field">
-            <span>Encoder</span>
+            <span class="field-label">
+              Encoder
+              <button
+                class="help-button"
+                type="button"
+                aria-label="Encoder help"
+                data-tooltip="Chooses how the final H.264 MP4 is encoded. Auto uses NVIDIA NVENC when available, which is fast on your GPU. NVIDIA NVENC is fastest. CPU libx264 can be smaller or more compatible, but it is much slower."
+              >?</button>
+            </span>
             <select id="encoder">
               <option value="auto">Auto</option>
               <option value="h264_nvenc">NVIDIA NVENC</option>
@@ -179,7 +251,15 @@
             </select>
           </label>
           <label class="field">
-            <span>Quality CRF/CQ</span>
+            <span class="field-label">
+              Quality CRF/CQ
+              <button
+                class="help-button"
+                type="button"
+                aria-label="Quality help"
+                data-tooltip="Controls final MP4 compression quality. Lower numbers mean better quality and larger files. 18 is a good high-quality default, 23 is smaller, and 12 is very high quality with very large files. NVENC uses this as CQ; libx264 uses it as CRF."
+              >?</button>
+            </span>
             <input id="crf" type="range" min="12" max="32" step="1" value="18" />
             <output id="crfValue">18</output>
           </label>
