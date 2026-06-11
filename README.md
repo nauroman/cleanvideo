@@ -54,6 +54,8 @@ The `Temporal` export setting reduces frame-to-frame flicker by optical-flow war
 
 The `0.5x` scale factor performs high-quality Lanczos downscaling before HYPIR enhancement, producing half-width and half-height output while giving the generator a smaller, cleaner input.
 
+`Create Film Adapter` samples the selected video into 512x512 training patches, starts a local HYPIR LoRA fine-tune job, and saves the resulting adapter under `work/adapters`. Completed adapters appear in the `Film Adapter` selector and can be used by preview/export. Adapter training is experimental: it can take a long time, may overfit noisy footage, and `Clean All` does not delete completed adapters.
+
 ## Reinstall dependencies
 
 ```powershell

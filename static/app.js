@@ -7,6 +7,9 @@ const state = {
   previewDirty: false,
   previewVersion: 0,
   exportInFlight: false,
+  adapterInFlight: false,
+  currentAdapterJobId: null,
+  adapterTimer: null,
   liveOriginalUrl: null,
   liveEnhancedUrl: null,
   frameEventQueue: [],
@@ -60,6 +63,9 @@ const els = {
   patchSize: document.querySelector("#patchSize"),
   stride: document.querySelector("#stride"),
   temporalConsistency: document.querySelector("#temporalConsistency"),
+  adapterSelect: document.querySelector("#adapterSelect"),
+  trainAdapterButton: document.querySelector("#trainAdapterButton"),
+  cancelAdapterButton: document.querySelector("#cancelAdapterButton"),
   seed: document.querySelector("#seed"),
   prompt: document.querySelector("#prompt"),
   encoder: document.querySelector("#encoder"),
@@ -177,6 +183,7 @@ function collectUiSettings() {
     patchSize: els.patchSize.value,
     stride: els.stride.value,
     temporalConsistency: els.temporalConsistency.value,
+    adapterId: els.adapterSelect.value,
     seed: els.seed.value,
     prompt: els.prompt.value,
     encoder: els.encoder.value,
@@ -189,6 +196,7 @@ function saveLocalState() {
     settings: collectUiSettings(),
     videoId: state.video?.id ?? null,
     currentJobId: state.exportInFlight ? state.currentJobId : null,
+    currentAdapterJobId: state.adapterInFlight ? state.currentAdapterJobId : null,
   };
   localStorage.setItem(settingsStorageKey, JSON.stringify(payload));
 }
@@ -209,6 +217,7 @@ function applySavedSettings(settings = {}) {
     ["patchSize", els.patchSize],
     ["stride", els.stride],
     ["temporalConsistency", els.temporalConsistency],
+    ["adapterId", els.adapterSelect],
     ["seed", els.seed],
     ["prompt", els.prompt],
     ["encoder", els.encoder],
@@ -216,6 +225,10 @@ function applySavedSettings(settings = {}) {
   ];
   for (const [key, element] of entries) {
     if (settings[key] !== undefined && element) {
+      if (element.tagName === "SELECT") {
+        const hasOption = Array.from(element.options).some((option) => option.value === String(settings[key]));
+        if (!hasOption) continue;
+      }
       element.value = settings[key];
     }
   }
@@ -238,6 +251,20 @@ async function api(path, options = {}) {
   return response.json();
 }
 
+async function loadAdapters(selectedId = els.adapterSelect.value || "base") {
+  const result = await api("/api/adapters");
+  const ids = new Set();
+  els.adapterSelect.replaceChildren();
+  for (const adapter of result.adapters || []) {
+    ids.add(adapter.id);
+    const option = document.createElement("option");
+    option.value = adapter.id;
+    option.textContent = adapter.name || adapter.id;
+    els.adapterSelect.appendChild(option);
+  }
+  els.adapterSelect.value = ids.has(selectedId) ? selectedId : "base";
+}
+
 function collectSettings() {
   const selectedScale = els.scaleBy.value;
   const presetLongestSide = resolutionPresets[selectedScale] ?? null;
@@ -257,6 +284,7 @@ function collectSettings() {
     patchSize,
     stride,
     temporalConsistency: els.temporalConsistency.value,
+    adapterId: els.adapterSelect.value,
     seed: Number(els.seed.value),
     device: "cuda",
   };
@@ -324,6 +352,11 @@ function setVideo(record, { persist = true } = {}) {
 
 async function restoreSession() {
   const saved = readLocalState();
+  try {
+    await loadAdapters(saved.settings?.adapterId || "base");
+  } catch (error) {
+    setActivity(`Could not load film adapters: ${error.message}`, 0);
+  }
   applySavedSettings(saved.settings);
   let restoredVideo = false;
   try {
@@ -336,6 +369,7 @@ async function restoreSession() {
       }
     }
     await restoreActiveExport(saved.currentJobId, { restoredVideo });
+    await restoreActiveAdapter(saved.currentAdapterJobId);
   } catch (error) {
     setActivity(`Could not restore session: ${error.message}`, 0);
   }
@@ -392,6 +426,39 @@ function resumeExportJob(job, { restoredVideo = false } = {}) {
   pollJob(job.id);
 }
 
+async function restoreActiveAdapter(savedJobId) {
+  let job = null;
+  if (savedJobId) {
+    try {
+      job = await api(`/api/jobs/${savedJobId}`);
+    } catch {
+      job = null;
+    }
+  }
+  if (!job || job.kind !== "adapter" || !["queued", "running"].includes(job.status)) {
+    try {
+      const result = await api("/api/jobs");
+      job = result.jobs.find((candidate) => (
+        candidate.kind === "adapter" && ["queued", "running"].includes(candidate.status)
+      ));
+    } catch {
+      job = null;
+    }
+  }
+  if (job) {
+    resumeAdapterJob(job);
+  }
+}
+
+function resumeAdapterJob(job) {
+  state.adapterInFlight = true;
+  state.currentAdapterJobId = job.id;
+  updateAdapterJobUi(job);
+  setExportEnabled(false);
+  saveLocalState();
+  pollAdapterJob(job.id);
+}
+
 async function refreshStatus() {
   try {
     const status = await api("/api/status");
@@ -421,7 +488,10 @@ function setExportEnabled(enabled) {
   els.exportButton.disabled = !enabled || !state.video || state.exportInFlight || state.previewInFlight;
   els.cancelExportButton.hidden = !state.exportInFlight;
   els.cancelExportButton.disabled = !state.exportInFlight;
-  els.clearGeneratedButton.disabled = state.exportInFlight || state.previewInFlight;
+  els.trainAdapterButton.disabled = !enabled || !state.video || state.exportInFlight || state.previewInFlight || state.adapterInFlight;
+  els.cancelAdapterButton.hidden = !state.adapterInFlight;
+  els.cancelAdapterButton.disabled = !state.adapterInFlight;
+  els.clearGeneratedButton.disabled = state.exportInFlight || state.previewInFlight || state.adapterInFlight;
 }
 
 function scheduleAutoPreview({ delay = 450, reason = "settings changed" } = {}) {
@@ -506,6 +576,52 @@ async function startExport() {
     setActivity(`Export failed: ${error.message}`, 0);
     state.exportInFlight = false;
     setExportEnabled(true);
+  }
+}
+
+async function startAdapterTraining() {
+  if (!state.video || state.adapterInFlight) return;
+  window.clearTimeout(state.previewTimer);
+  state.previewDirty = false;
+  state.adapterInFlight = true;
+  setExportEnabled(false);
+  saveLocalState();
+  els.frameProgressText.textContent = "Adapter: preparing";
+  els.etaText.textContent = "ETA: long running";
+  setActivity("Starting film adapter training", 0.02);
+  try {
+    const job = await api("/api/adapters/train", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        videoId: state.video.id,
+        prompt: els.prompt.value || "film-specific restoration, natural detail, consistent texture",
+        maxFrames: 32,
+        patchesPerFrame: 3,
+        maxTrainSteps: 300,
+      }),
+    });
+    state.currentAdapterJobId = job.id;
+    saveLocalState();
+    pollAdapterJob(job.id);
+  } catch (error) {
+    setActivity(`Film adapter failed to start: ${error.message}`, 0);
+    state.adapterInFlight = false;
+    state.currentAdapterJobId = null;
+    saveLocalState();
+    setExportEnabled(true);
+  }
+}
+
+async function cancelAdapterTraining() {
+  if (!state.currentAdapterJobId) return;
+  els.cancelAdapterButton.disabled = true;
+  setActivity("Stopping film adapter training", null);
+  try {
+    await api(`/api/jobs/${state.currentAdapterJobId}/cancel`, { method: "POST" });
+  } catch (error) {
+    setActivity(`Stop failed: ${error.message}`, null);
+    els.cancelAdapterButton.disabled = false;
   }
 }
 
@@ -690,6 +806,59 @@ function updateJobUi(job) {
   }
 }
 
+function updateAdapterJobUi(job) {
+  setActivity(job.message, job.progress);
+  if (job.framesTotal) {
+    els.frameProgressText.textContent = `Adapter: ${job.framesDone} training patches`;
+  } else {
+    els.frameProgressText.textContent = "Adapter: preparing";
+  }
+  els.etaText.textContent = "ETA: long running";
+}
+
+function pollAdapterJob(jobId) {
+  if (state.adapterTimer) clearInterval(state.adapterTimer);
+  state.adapterTimer = setInterval(async () => {
+    try {
+      const job = await api(`/api/jobs/${jobId}`);
+      updateAdapterJobUi(job);
+      if (job.status === "done") {
+        clearInterval(state.adapterTimer);
+        state.adapterTimer = null;
+        state.adapterInFlight = false;
+        state.currentAdapterJobId = null;
+        if (job.adapterId) {
+          await loadAdapters(job.adapterId);
+          saveLocalState();
+        }
+        els.frameProgressText.textContent = job.adapterName
+          ? `Adapter: ${job.adapterName}`
+          : "Adapter: ready";
+        els.etaText.textContent = "ETA: --";
+        setExportEnabled(true);
+        await refreshStatus();
+      }
+      if (job.status === "error" || job.status === "cancelled") {
+        clearInterval(state.adapterTimer);
+        state.adapterTimer = null;
+        setActivity(job.status === "cancelled" ? job.message : `Film adapter failed: ${job.error || job.message}`, job.progress);
+        state.adapterInFlight = false;
+        state.currentAdapterJobId = null;
+        saveLocalState();
+        setExportEnabled(true);
+      }
+    } catch (error) {
+      clearInterval(state.adapterTimer);
+      state.adapterTimer = null;
+      setActivity(`Film adapter polling failed: ${error.message}`, 0);
+      state.adapterInFlight = false;
+      state.currentAdapterJobId = null;
+      saveLocalState();
+      setExportEnabled(true);
+    }
+  }, 1200);
+}
+
 function pollJob(jobId) {
   if (state.jobTimer) clearInterval(state.jobTimer);
   state.jobTimer = setInterval(async () => {
@@ -770,6 +939,8 @@ els.sourceVideo.addEventListener("seeked", () => {
 
 els.exportButton.addEventListener("click", startExport);
 els.cancelExportButton.addEventListener("click", cancelExport);
+els.trainAdapterButton.addEventListener("click", startAdapterTraining);
+els.cancelAdapterButton.addEventListener("click", cancelAdapterTraining);
 els.openOutputFolderButton.addEventListener("click", openOutputFolder);
 els.clearGeneratedButton.addEventListener("click", clearGeneratedFiles);
 els.refreshStatusButton.addEventListener("click", refreshStatus);
@@ -797,6 +968,10 @@ els.stride.addEventListener("change", () => {
   scheduleAutoPreview();
 });
 els.temporalConsistency.addEventListener("change", saveLocalState);
+els.adapterSelect.addEventListener("change", () => {
+  saveLocalState();
+  scheduleAutoPreview({ delay: 300, reason: "film adapter changed" });
+});
 els.seed.addEventListener("input", () => {
   saveLocalState();
   scheduleAutoPreview();

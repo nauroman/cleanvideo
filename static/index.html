@@ -4,7 +4,7 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>CleanVideo</title>
-    <link rel="stylesheet" href="/styles.css?v=2026-06-11-clean-all-verify-v1" />
+    <link rel="stylesheet" href="/styles.css?v=2026-06-11-film-adapter-v1" />
   </head>
   <body>
     <main class="app-shell">
@@ -235,6 +235,30 @@
           </div>
           <div class="field">
             <span class="field-label">
+              Film Adapter
+              <button
+                class="help-button"
+                type="button"
+                aria-label="Film Adapter help"
+                data-tooltip="Optional film-specific HYPIR LoRA adapter. Create Film Adapter samples this video, trains a small local adapter, and then lets preview/export use it. Training can take a long time and may overfit noisy source material."
+              >?</button>
+            </span>
+            <select id="adapterSelect" aria-label="Film Adapter">
+              <option value="base">Base HYPIR</option>
+            </select>
+          </div>
+          <div class="field adapter-actions">
+            <button id="trainAdapterButton" class="secondary-button" type="button" disabled>
+              <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3v18M5 12h14M6 19l12-14"/></svg>
+              Create Film Adapter
+            </button>
+            <button id="cancelAdapterButton" class="danger-button" type="button" hidden>
+              <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 6l12 12M18 6 6 18"/></svg>
+              Stop Adapter
+            </button>
+          </div>
+          <div class="field">
+            <span class="field-label">
               Seed
               <button
                 class="help-button"
@@ -293,6 +317,6 @@
         </section>
       </aside>
     </main>
-    <script src="/app.js?v=2026-06-11-clean-all-verify-v1" type="module"></script>
+    <script src="/app.js?v=2026-06-11-film-adapter-v1" type="module"></script>
   </body>
 </html>

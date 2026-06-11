@@ -21,6 +21,7 @@ from fastapi.staticfiles import StaticFiles
 from PIL import Image
 from pydantic import BaseModel, Field
 
+from .film_adapter import build_adapter_dataset
 from .hypir_engine import HypirSettings, engine
 from .temporal_stabilizer import TemporalConsistency, stabilize_frame, temporal_mode_enabled
 from .video_ops import (
@@ -35,16 +36,18 @@ from .video_ops import (
 
 ROOT = Path(__file__).resolve().parents[1]
 STATIC_DIR = ROOT / "static"
+HYPIR_ROOT = ROOT / "external" / "HYPIR"
 WORK_DIR = ROOT / "work"
 UPLOAD_DIR = WORK_DIR / "uploads"
 PREVIEW_DIR = WORK_DIR / "previews"
 EXPORT_DIR = WORK_DIR / "exports"
 JOB_DIR = WORK_DIR / "jobs"
 CACHE_DIR = WORK_DIR / "cache"
-for directory in [UPLOAD_DIR, PREVIEW_DIR, EXPORT_DIR, JOB_DIR, CACHE_DIR]:
+ADAPTER_DIR = WORK_DIR / "adapters"
+for directory in [UPLOAD_DIR, PREVIEW_DIR, EXPORT_DIR, JOB_DIR, CACHE_DIR, ADAPTER_DIR]:
     directory.mkdir(parents=True, exist_ok=True)
 GENERATED_DIRS = [PREVIEW_DIR, CACHE_DIR, JOB_DIR, EXPORT_DIR]
-APP_BUILD = "2026-06-11-clean-all-verify-v1"
+APP_BUILD = "2026-06-11-film-adapter-v1"
 
 
 class ProcessSettings(BaseModel):
@@ -57,9 +60,10 @@ class ProcessSettings(BaseModel):
     stride: int = Field(default=256, ge=128, le=1024)
     seed: int = Field(default=231, ge=-1)
     temporalConsistency: TemporalConsistency = "medium"
+    adapterId: str = "base"
     device: Literal["cuda"] = "cuda"
 
-    def to_hypir(self) -> HypirSettings:
+    def to_hypir(self, adapter_weight_path: Path | None = None) -> HypirSettings:
         return HypirSettings(
             prompt=self.prompt.strip(),
             scale_by=self.scaleBy,
@@ -69,6 +73,7 @@ class ProcessSettings(BaseModel):
             stride=self.stride,
             seed=self.seed,
             device=self.device,
+            weight_path=str(adapter_weight_path) if adapter_weight_path else None,
         )
 
 
@@ -81,6 +86,14 @@ class ExportRequest(ProcessSettings):
     videoId: str
     crf: int = Field(default=18, ge=12, le=32)
     encoder: Literal["auto", "h264_nvenc", "libx264"] = "auto"
+
+
+class AdapterTrainRequest(BaseModel):
+    videoId: str
+    prompt: str = "film-specific restoration, natural detail, consistent texture"
+    maxFrames: int = Field(default=32, ge=4, le=240)
+    patchesPerFrame: int = Field(default=3, ge=1, le=9)
+    maxTrainSteps: int = Field(default=300, ge=20, le=3000)
 
 
 class JobState(BaseModel):
@@ -103,6 +116,8 @@ class JobState(BaseModel):
     cacheMisses: int = 0
     outputUrl: str | None = None
     outputPath: str | None = None
+    adapterId: str | None = None
+    adapterName: str | None = None
     error: str | None = None
     startedAt: str
     updatedAt: str
@@ -129,10 +144,12 @@ app.add_middleware(
 )
 
 videos: dict[str, dict] = {}
+adapters: dict[str, dict] = {}
 jobs: dict[str, JobState] = {}
 job_frame_events: dict[str, list[FrameEvent]] = {}
 jobs_lock = threading.Lock()
 cancelled_jobs: set[str] = set()
+job_processes: dict[str, subprocess.Popen] = {}
 
 
 def now_iso() -> str:
@@ -162,6 +179,53 @@ def get_video(video_id: str) -> dict:
     if not record:
         raise HTTPException(status_code=404, detail="Video not found")
     return record
+
+
+def adapter_meta_path(adapter_id: str) -> Path:
+    return ADAPTER_DIR / adapter_id / "adapter.json"
+
+
+def save_adapter_record(record: dict) -> None:
+    path = adapter_meta_path(record["id"])
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(record, indent=2), encoding="utf-8")
+
+
+def load_adapter_records() -> None:
+    adapters.clear()
+    for meta_path in ADAPTER_DIR.glob("*/adapter.json"):
+        try:
+            record = json.loads(meta_path.read_text(encoding="utf-8"))
+            weight_path = Path(record["weightPath"])
+            if weight_path.exists():
+                adapters[record["id"]] = record
+        except Exception:
+            continue
+
+
+def list_adapter_records() -> list[dict]:
+    base = {
+        "id": "base",
+        "name": "Base HYPIR",
+        "status": "ready",
+        "weightPath": str(engine.weight_path),
+        "createdAt": None,
+        "videoId": None,
+    }
+    ordered = sorted(adapters.values(), key=lambda record: record.get("createdAt") or "", reverse=True)
+    return [base, *ordered]
+
+
+def get_adapter_weight_path(adapter_id: str) -> Path | None:
+    if adapter_id == "base":
+        return None
+    record = adapters.get(adapter_id)
+    if not record:
+        raise HTTPException(status_code=404, detail="Film adapter not found")
+    weight_path = Path(record["weightPath"])
+    if not weight_path.exists():
+        raise HTTPException(status_code=404, detail="Film adapter weights are missing")
+    return weight_path
 
 
 def update_job(job_id: str, **changes) -> None:
@@ -393,6 +457,7 @@ def clear_generated_dirs() -> dict:
 @app.on_event("startup")
 def startup() -> None:
     load_video_records()
+    load_adapter_records()
 
 
 @app.get("/api/status")
@@ -414,6 +479,192 @@ def status() -> dict:
 @app.get("/api/videos")
 def list_videos() -> dict:
     return {"videos": list(videos.values())}
+
+
+@app.get("/api/adapters")
+def list_adapters() -> dict:
+    return {"adapters": list_adapter_records()}
+
+
+def latest_checkpoint_weight(output_dir: Path) -> Path | None:
+    checkpoints = []
+    for checkpoint in output_dir.glob("checkpoint-*"):
+        if not checkpoint.is_dir():
+            continue
+        try:
+            step = int(checkpoint.name.split("-", 1)[1])
+        except Exception:
+            continue
+        weight_path = checkpoint / "state_dict.pth"
+        if weight_path.exists():
+            checkpoints.append((step, weight_path))
+    if not checkpoints:
+        return None
+    return sorted(checkpoints, key=lambda item: item[0])[-1][1]
+
+
+def run_adapter_training(job_id: str, request: AdapterTrainRequest) -> None:
+    process: subprocess.Popen | None = None
+    try:
+        record = get_video(request.videoId)
+        adapter_id = job_id
+        adapter_root = ADAPTER_DIR / adapter_id
+        adapter_root.mkdir(parents=True, exist_ok=True)
+        source = Path(record["path"])
+        metadata = record["metadata"]
+        prompt = request.prompt.strip() or "film-specific restoration, natural detail, consistent texture"
+        update_job(
+            job_id,
+            status="running",
+            progress=0.04,
+            message="Sampling film frames for adapter training",
+            videoId=request.videoId,
+        )
+        dataset = build_adapter_dataset(
+            video_path=source,
+            duration_seconds=float(metadata.get("duration") or 0),
+            adapter_root=adapter_root,
+            base_model_path=engine.base_model_path,
+            prompt=prompt,
+            max_frames=request.maxFrames,
+            patches_per_frame=request.patchesPerFrame,
+            max_train_steps=request.maxTrainSteps,
+        )
+        if job_id in cancelled_jobs:
+            update_job(job_id, status="cancelled", progress=0.12, message="Film adapter training cancelled")
+            cancelled_jobs.discard(job_id)
+            return
+
+        update_job(
+            job_id,
+            progress=0.16,
+            message=f"Training film adapter on {dataset.patches} patches from {dataset.frames} frames",
+            framesDone=dataset.patches,
+            framesTotal=dataset.patches,
+        )
+        log_path = adapter_root / "train.log"
+        env = os.environ.copy()
+        env["PYTHONIOENCODING"] = "utf-8"
+        env["TOKENIZERS_PARALLELISM"] = "false"
+        command = [
+            sys.executable,
+            "-m",
+            "accelerate.commands.launch",
+            "--num_processes",
+            "1",
+            str(HYPIR_ROOT / "train.py"),
+            "--config",
+            str(dataset.config_path),
+        ]
+        with log_path.open("w", encoding="utf-8", errors="replace") as log_fp:
+            log_fp.write(" ".join(command) + "\n")
+            log_fp.flush()
+            process = subprocess.Popen(
+                command,
+                cwd=HYPIR_ROOT,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                env=env,
+            )
+            job_processes[job_id] = process
+            last_update = time.monotonic()
+            assert process.stdout is not None
+            for line in process.stdout:
+                log_fp.write(line)
+                if time.monotonic() - last_update > 5:
+                    checkpoint = latest_checkpoint_weight(dataset.output_dir)
+                    progress = 0.24 if checkpoint is None else 0.55
+                    update_job(
+                        job_id,
+                        progress=progress,
+                        message=f"Training film adapter: {line.strip()[:140] or 'running'}",
+                    )
+                    last_update = time.monotonic()
+                if job_id in cancelled_jobs:
+                    process.terminate()
+                    try:
+                        process.wait(timeout=20)
+                    except subprocess.TimeoutExpired:
+                        process.kill()
+                    update_job(job_id, status="cancelled", progress=0.2, message="Film adapter training cancelled")
+                    cancelled_jobs.discard(job_id)
+                    return
+            return_code = process.wait()
+        if return_code != 0:
+            raise RuntimeError(f"HYPIR adapter training failed with exit code {return_code}. See {log_path}")
+
+        weight_path = latest_checkpoint_weight(dataset.output_dir)
+        if not weight_path:
+            raise RuntimeError(f"Training finished, but no checkpoint state_dict.pth was found under {dataset.output_dir}")
+        adapter_name = f"{Path(record['name']).stem} Film Adapter"
+        adapter_record = {
+            "id": adapter_id,
+            "name": adapter_name,
+            "status": "ready",
+            "videoId": request.videoId,
+            "videoName": record["name"],
+            "weightPath": str(weight_path),
+            "rootPath": str(adapter_root),
+            "prompt": prompt,
+            "frames": dataset.frames,
+            "patches": dataset.patches,
+            "maxTrainSteps": request.maxTrainSteps,
+            "createdAt": now_iso(),
+        }
+        adapters[adapter_id] = adapter_record
+        save_adapter_record(adapter_record)
+        update_job(
+            job_id,
+            status="done",
+            progress=1.0,
+            message=f"Film adapter ready: {adapter_name}",
+            adapterId=adapter_id,
+            adapterName=adapter_name,
+            outputPath=str(weight_path),
+            etaSeconds=0,
+        )
+    except Exception as exc:
+        update_job(
+            job_id,
+            status="error",
+            progress=0,
+            message="Film adapter training failed",
+            etaSeconds=None,
+            error=f"{exc}\n{traceback.format_exc()}",
+        )
+    finally:
+        if process is not None and process.poll() is None:
+            process.terminate()
+        job_processes.pop(job_id, None)
+        cancelled_jobs.discard(job_id)
+
+
+@app.post("/api/adapters/train")
+def train_adapter(request: AdapterTrainRequest, background_tasks: BackgroundTasks) -> dict:
+    get_video(request.videoId)
+    with jobs_lock:
+        active_jobs = [job.id for job in jobs.values() if job.status in {"queued", "running"}]
+    if active_jobs:
+        raise HTTPException(status_code=409, detail="Wait for the current job to finish before training a film adapter")
+    job_id = uuid.uuid4().hex
+    stamp = now_iso()
+    with jobs_lock:
+        jobs[job_id] = JobState(
+            id=job_id,
+            kind="adapter",
+            status="queued",
+            progress=0,
+            message="Queued film adapter training",
+            videoId=request.videoId,
+            startedAt=stamp,
+            updatedAt=stamp,
+        )
+        job_frame_events[job_id] = []
+    background_tasks.add_task(run_adapter_training, job_id, request)
+    return jobs[job_id].model_dump()
 
 
 @app.post("/api/open-output-folder")
@@ -473,13 +724,14 @@ async def upload_video(file: UploadFile = File(...)) -> dict:
 @app.post("/api/preview")
 def preview_frame(request: PreviewRequest) -> dict:
     record = get_video(request.videoId)
+    adapter_weight_path = get_adapter_weight_path(request.adapterId)
     preview_id = uuid.uuid4().hex
     preview_root = PREVIEW_DIR / preview_id
     original = preview_root / "original.png"
     enhanced = preview_root / "enhanced.png"
     try:
         extract_frame(Path(record["path"]), request.seconds, original)
-        result = engine.enhance_file(original, enhanced, request.to_hypir())
+        result = engine.enhance_file(original, enhanced, request.to_hypir(adapter_weight_path))
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Preview failed: {exc}") from exc
 
@@ -540,7 +792,8 @@ def run_export(job_id: str, request: ExportRequest) -> None:
 
         frames = reusable_frames(source, raw_frames, expected_count)
         total = len(frames)
-        settings = request.to_hypir()
+        adapter_weight_path = get_adapter_weight_path(request.adapterId)
+        settings = request.to_hypir(adapter_weight_path)
         outputs = [
             (frame, enhanced_frames / frame.name, valid_image(enhanced_frames / frame.name))
             for frame in frames
@@ -745,7 +998,13 @@ def cancel_job(job_id: str) -> dict:
     if job.status in {"done", "error", "cancelled"}:
         return job.model_dump()
     cancelled_jobs.add(job_id)
-    update_job(job_id, message="Stopping after the current frame")
+    process = job_processes.get(job_id)
+    if process and process.poll() is None:
+        process.terminate()
+    update_job(
+        job_id,
+        message="Stopping film adapter training" if job.kind == "adapter" else "Stopping after the current frame",
+    )
     return jobs[job_id].model_dump()
 
 

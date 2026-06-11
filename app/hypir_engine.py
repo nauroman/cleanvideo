@@ -47,12 +47,14 @@ class HypirSettings:
     stride: int = 256
     seed: int = 231
     device: str = "cuda"
+    weight_path: str | None = None
 
 
 class HypirEngine:
     def __init__(self) -> None:
         self._model: SD2Enhancer | None = None
         self._device: str | None = None
+        self._loaded_weight_path: Path | None = None
         self._lock = threading.Lock()
         self._to_tensor = transforms.ToTensor()
 
@@ -69,6 +71,7 @@ class HypirEngine:
             "cuda": torch.version.cuda,
             "gpu": torch.cuda.get_device_name(0) if torch.cuda.is_available() else None,
             "weightPath": str(self.weight_path),
+            "loadedWeightPath": str(self._loaded_weight_path) if self._loaded_weight_path else None,
             "baseModelPath": str(self.base_model_path),
             "weightPresent": self.weight_path.exists(),
             "baseModelPresent": self.base_model_path.exists(),
@@ -89,17 +92,22 @@ class HypirEngine:
             return "cuda"
         return requested_device
 
-    def _load_locked(self, device: str) -> None:
-        if self._model is not None and self._device == device:
+    def _load_locked(self, device: str, weight_path: Path | None = None) -> None:
+        resolved_weight_path = weight_path or self.weight_path
+        if (
+            self._model is not None
+            and self._device == device
+            and self._loaded_weight_path == resolved_weight_path
+        ):
             return
-        if not self.weight_path.exists():
-            raise FileNotFoundError(f"Missing HYPIR weights: {self.weight_path}")
+        if not resolved_weight_path.exists():
+            raise FileNotFoundError(f"Missing HYPIR weights: {resolved_weight_path}")
         if not self.base_model_path.exists():
             raise FileNotFoundError(f"Missing Stable Diffusion base model: {self.base_model_path}")
 
         model = SD2Enhancer(
             base_model_path=str(self.base_model_path),
-            weight_path=str(self.weight_path),
+            weight_path=str(resolved_weight_path),
             lora_modules=LORA_MODULES,
             lora_rank=256,
             model_t=200,
@@ -109,6 +117,7 @@ class HypirEngine:
         model.init_models()
         self._model = model
         self._device = device
+        self._loaded_weight_path = resolved_weight_path
 
     def enhance_file(self, input_path: Path, output_path: Path, settings: HypirSettings) -> dict:
         output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -120,7 +129,8 @@ class HypirEngine:
 
         with self._lock:
             device = self._resolve_device(settings.device)
-            self._load_locked(device)
+            adapter_weight_path = Path(settings.weight_path) if settings.weight_path else None
+            self._load_locked(device, adapter_weight_path)
             assert self._model is not None
 
             torch.manual_seed(seed)

@@ -541,6 +541,15 @@ svg {
   margin-bottom: 0;
 }
 
+.adapter-actions {
+  grid-template-columns: 1fr;
+}
+
+.adapter-actions .secondary-button,
+.adapter-actions .danger-button {
+  width: 100%;
+}
+
 .field input,
 .field select,
 .field textarea {
