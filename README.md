@@ -2,6 +2,8 @@
 
 Local video enhancement UI for HYPIR with CUDA preview and H.264 export.
 
+![CleanVideo live export preview](docs/assets/cleanvideo-live-export.png)
+
 ## Run
 
 On Windows, double-click:
