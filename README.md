@@ -14,6 +14,15 @@ Start-CleanVideo.cmd
 
 It starts the local server if needed and opens <http://127.0.0.1:8765>.
 If an idle CleanVideo server is already running, the launcher restarts it so the latest local code is used.
+On first launch, it also runs setup automatically if required. The setup checks/install/downloads:
+
+- `uv` and a Python 3.10 virtual environment.
+- Python inference dependencies, including PyTorch CUDA wheels.
+- FFmpeg / ffprobe for frame extraction and H.264 export.
+- HYPIR and SUPIR source trees.
+- HYPIR weights and the Stable Diffusion 2.1 base model files.
+
+If an automatic download fails, the console prints the exact manual download URL and the local folder/file where it must be placed.
 
 From Codex, use the Run menu action:
 
@@ -45,6 +54,12 @@ During export, enhanced frames are cached under `work/cache` using the selected 
 
 ```powershell
 .\scripts\setup.ps1
+```
+
+To only install missing items:
+
+```powershell
+.\scripts\setup.ps1 -IfNeeded
 ```
 
 HYPIR is licensed for non-commercial use by its upstream project. The official `stabilityai/stable-diffusion-2-1-base` Hugging Face repo was unavailable during setup, so the local base model was downloaded from a public diffusers-compatible mirror.

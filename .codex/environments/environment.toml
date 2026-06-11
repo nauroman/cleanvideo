@@ -8,17 +8,17 @@ script = ""
 [[actions]]
 name = "Launch CleanVideo"
 icon = "run"
-command = "powershell -NoProfile -ExecutionPolicy Bypass -File .\\scripts\\launch.ps1 -RestartWhenIdle"
+command = "powershell -NoProfile -ExecutionPolicy Bypass -File .\\scripts\\start.ps1 -RestartWhenIdle"
 
 [[actions]]
 name = "Force Restart CleanVideo"
 icon = "tool"
-command = "powershell -NoProfile -ExecutionPolicy Bypass -File .\\scripts\\launch.ps1 -Restart"
+command = "powershell -NoProfile -ExecutionPolicy Bypass -File .\\scripts\\start.ps1 -Restart"
 
 [[actions]]
 name = "Run Server Only"
 icon = "run"
-command = "powershell -NoProfile -ExecutionPolicy Bypass -File .\\run.ps1"
+command = "powershell -NoProfile -ExecutionPolicy Bypass -File .\\scripts\\start.ps1 -NoBrowser -RestartWhenIdle"
 
 [[actions]]
 name = "Setup / Reinstall Dependencies"
