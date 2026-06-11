@@ -1,0 +1,13 @@
+.venv/
+models/
+external/
+work/
+__pycache__/
+*.py[cod]
+*.pyo
+.env
+*.log
+node_modules/
+package-lock.json
+package.json
+

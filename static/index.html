@@ -1,0 +1,191 @@
+<!doctype html>
+<html lang="ru">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>CleanVideo</title>
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <main class="app-shell">
+      <aside class="engine-rail" aria-label="Engines">
+        <div class="brand">
+          <div class="brand-mark">CV</div>
+          <div>
+            <h1>CleanVideo</h1>
+            <p>Local restoration</p>
+          </div>
+        </div>
+
+        <section class="rail-section">
+          <h2>Engine</h2>
+          <button class="engine-card selected" type="button">
+            <span>HYPIR</span>
+            <small>SD2 local CUDA</small>
+          </button>
+          <button class="engine-card disabled" type="button" aria-disabled="true">
+            <span>SUPIR</span>
+            <small>Later</small>
+          </button>
+        </section>
+
+        <section class="rail-section status-stack">
+          <h2>Status</h2>
+          <div class="status-row">
+            <span>GPU</span>
+            <strong id="gpuStatus">checking</strong>
+          </div>
+          <div class="status-row">
+            <span>NVENC</span>
+            <strong id="nvencStatus">checking</strong>
+          </div>
+          <div class="status-row">
+            <span>Model</span>
+            <strong id="modelStatus">cold</strong>
+          </div>
+        </section>
+      </aside>
+
+      <section class="workspace">
+        <header class="topbar">
+          <div class="upload-area">
+            <label class="file-button">
+              <input id="videoInput" type="file" accept="video/*" />
+              <span>Choose Video</span>
+            </label>
+            <div class="video-title">
+              <strong id="videoName">No video selected</strong>
+              <span id="videoMeta">Upload an MP4, MOV, MKV, or AVI file</span>
+            </div>
+          </div>
+          <div class="topbar-actions">
+            <button id="refreshStatusButton" class="icon-button" type="button" title="Refresh status" aria-label="Refresh status">
+              <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20 11a8 8 0 0 0-14.2-5M4 5v5h5M4 13a8 8 0 0 0 14.2 5M20 19v-5h-5"/></svg>
+            </button>
+          </div>
+        </header>
+
+        <section class="viewer-grid">
+          <article class="viewer-pane">
+            <div class="pane-head">
+              <span>Original</span>
+              <small id="originalInfo">source frame</small>
+            </div>
+            <div class="media-box">
+              <video id="sourceVideo" controls muted playsinline hidden></video>
+              <img id="originalPreview" alt="Original preview frame" hidden />
+              <div id="originalEmpty" class="empty-state">Upload video</div>
+            </div>
+          </article>
+
+          <article class="viewer-pane">
+            <div class="pane-head">
+              <span>Enhanced</span>
+              <small id="enhancedInfo">HYPIR preview</small>
+            </div>
+            <div class="media-box">
+              <img id="enhancedPreview" alt="Enhanced preview frame" hidden />
+              <div id="enhancedEmpty" class="empty-state">Preview frame</div>
+            </div>
+          </article>
+        </section>
+
+        <section class="timeline-panel">
+          <div class="timeline-top">
+            <span id="currentTime">00:00.000</span>
+            <span id="durationTime">00:00.000</span>
+          </div>
+          <input id="timeline" class="timeline" type="range" min="0" max="0" step="0.033" value="0" />
+          <div class="timeline-actions">
+            <button id="previewButton" class="primary-button" type="button" disabled>
+              <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 12h14M12 5l7 7-7 7"/></svg>
+              Preview Frame
+            </button>
+            <button id="exportButton" class="secondary-button" type="button" disabled>
+              <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3v12M7 10l5 5 5-5M5 21h14"/></svg>
+              Export Video
+            </button>
+            <span id="activityText">Idle</span>
+          </div>
+          <div class="progress-wrap">
+            <div id="jobProgress" class="progress-bar"></div>
+          </div>
+          <a id="downloadLink" class="download-link" href="#" download hidden>Download result</a>
+        </section>
+      </section>
+
+      <aside class="inspector" aria-label="Settings">
+        <section class="panel">
+          <h2>Resolution</h2>
+          <label class="field">
+            <span>Scale Mode</span>
+            <select id="scaleBy">
+              <option value="factor">Scale factor</option>
+              <option value="longest_side">Target longest side</option>
+            </select>
+          </label>
+          <label id="upscaleField" class="field">
+            <span>Upscale</span>
+            <select id="upscale">
+              <option value="1">1x</option>
+              <option value="2">2x</option>
+              <option value="3">3x</option>
+              <option value="4">4x</option>
+            </select>
+          </label>
+          <label id="targetField" class="field hidden">
+            <span>Longest Side</span>
+            <input id="targetLongestSide" type="number" min="256" max="8192" step="64" value="1920" />
+          </label>
+        </section>
+
+        <section class="panel">
+          <h2>HYPIR Quality</h2>
+          <label class="field">
+            <span>Patch Size</span>
+            <select id="patchSize">
+              <option value="512">512</option>
+              <option value="768">768</option>
+              <option value="1024">1024</option>
+            </select>
+          </label>
+          <label class="field">
+            <span>Stride</span>
+            <select id="stride">
+              <option value="256">256</option>
+              <option value="384">384</option>
+              <option value="512">512</option>
+              <option value="768">768</option>
+            </select>
+          </label>
+          <label class="field">
+            <span>Seed</span>
+            <input id="seed" type="number" value="231" />
+          </label>
+          <label class="field">
+            <span>Prompt</span>
+            <textarea id="prompt" rows="4" spellcheck="false">high quality, sharp details, natural texture</textarea>
+          </label>
+        </section>
+
+        <section class="panel">
+          <h2>H.264 Export</h2>
+          <label class="field">
+            <span>Encoder</span>
+            <select id="encoder">
+              <option value="auto">Auto</option>
+              <option value="h264_nvenc">NVIDIA NVENC</option>
+              <option value="libx264">CPU libx264</option>
+            </select>
+          </label>
+          <label class="field">
+            <span>Quality CRF/CQ</span>
+            <input id="crf" type="range" min="12" max="32" step="1" value="18" />
+            <output id="crfValue">18</output>
+          </label>
+        </section>
+      </aside>
+    </main>
+    <script src="/app.js" type="module"></script>
+  </body>
+</html>
