@@ -8,7 +8,7 @@ import numpy as np
 from PIL import Image
 
 
-TemporalConsistency = Literal["off", "light", "medium", "strong"]
+TemporalConsistency = Literal["off", "light", "medium", "strong", "extra_strong"]
 
 
 @dataclass(frozen=True)
@@ -24,6 +24,7 @@ TEMPORAL_PROFILES: dict[TemporalConsistency, TemporalProfile] = {
     "light": TemporalProfile(blend=0.16, diff_sigma=18.0, scene_cut_threshold=42.0, max_analysis_side=960),
     "medium": TemporalProfile(blend=0.26, diff_sigma=22.0, scene_cut_threshold=48.0, max_analysis_side=960),
     "strong": TemporalProfile(blend=0.38, diff_sigma=28.0, scene_cut_threshold=56.0, max_analysis_side=960),
+    "extra_strong": TemporalProfile(blend=0.54, diff_sigma=38.0, scene_cut_threshold=68.0, max_analysis_side=960),
 }
 
 

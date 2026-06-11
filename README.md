@@ -50,7 +50,7 @@ The app uses PyTorch CUDA for HYPIR inference and `h264_nvenc` for H.264 export 
 
 During export, enhanced frames are cached under `work/cache` using the selected video and HYPIR settings. If the app is stopped mid-export, starting the same export again reuses already enhanced frames instead of generating them again. The browser also stores the last selected server-side video id and UI settings in `localStorage`.
 
-The `Temporal` export setting reduces frame-to-frame flicker by optical-flow warping the previous enhanced frame onto the current source frame and blending stable areas after each HYPIR pass. `Medium` is the default balance; `Strong` can be steadier but may soften fast motion, and `Off` preserves the old independent-frame behavior.
+The `Temporal` export setting reduces frame-to-frame flicker by optical-flow warping the previous enhanced frame onto the current source frame and blending stable areas after each HYPIR pass. `Medium` is the default balance; `Strong` and `Extra Strong` can be steadier but may soften fast motion or add ghosting, and `Off` preserves the old independent-frame behavior.
 
 ## Reinstall dependencies
 

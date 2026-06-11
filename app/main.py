@@ -43,7 +43,7 @@ CACHE_DIR = WORK_DIR / "cache"
 for directory in [UPLOAD_DIR, PREVIEW_DIR, EXPORT_DIR, JOB_DIR, CACHE_DIR]:
     directory.mkdir(parents=True, exist_ok=True)
 GENERATED_DIRS = [PREVIEW_DIR, CACHE_DIR, JOB_DIR, EXPORT_DIR]
-APP_BUILD = "2026-06-11-temporal-v1"
+APP_BUILD = "2026-06-11-temporal-extra-strong-v1"
 
 
 class ProcessSettings(BaseModel):
