@@ -2,7 +2,10 @@ from __future__ import annotations
 
 import json
 import hashlib
+import os
 import shutil
+import subprocess
+import sys
 import threading
 import time
 import traceback
@@ -38,6 +41,7 @@ JOB_DIR = WORK_DIR / "jobs"
 CACHE_DIR = WORK_DIR / "cache"
 for directory in [UPLOAD_DIR, PREVIEW_DIR, EXPORT_DIR, JOB_DIR, CACHE_DIR]:
     directory.mkdir(parents=True, exist_ok=True)
+GENERATED_DIRS = [PREVIEW_DIR, CACHE_DIR, JOB_DIR, EXPORT_DIR]
 
 
 class ProcessSettings(BaseModel):
@@ -226,6 +230,68 @@ def eta_seconds(started: float, completed_misses: int, remaining_misses: int) ->
     return elapsed / completed_misses * remaining_misses
 
 
+def open_local_folder(path: Path) -> None:
+    path.mkdir(parents=True, exist_ok=True)
+    if os.name == "nt":
+        os.startfile(str(path))  # type: ignore[attr-defined]
+        return
+    if sys.platform == "darwin":
+        subprocess.Popen(["open", str(path)])
+        return
+    subprocess.Popen(["xdg-open", str(path)])
+
+
+def ensure_work_path(path: Path) -> None:
+    root = WORK_DIR.resolve()
+    resolved = path.resolve()
+    if resolved != root and root not in resolved.parents:
+        raise ValueError(f"Refusing to clean outside work directory: {resolved}")
+
+
+def path_usage(path: Path) -> dict:
+    if not path.exists():
+        return {"files": 0, "bytes": 0}
+    if path.is_file():
+        return {"files": 1, "bytes": path.stat().st_size}
+    files = 0
+    bytes_used = 0
+    for child in path.rglob("*"):
+        if child.is_file():
+            files += 1
+            bytes_used += child.stat().st_size
+    return {"files": files, "bytes": bytes_used}
+
+
+def remove_generated_path(path: Path, *, recreate: bool) -> dict:
+    ensure_work_path(path)
+    usage = path_usage(path)
+    if path.exists():
+        if path.is_file():
+            path.unlink()
+        else:
+            shutil.rmtree(path)
+    if recreate:
+        path.mkdir(parents=True, exist_ok=True)
+    return usage
+
+
+def clear_generated_dirs() -> dict:
+    total_files = 0
+    total_bytes = 0
+    cleaned: dict[str, dict] = {}
+    for directory in GENERATED_DIRS:
+        usage = remove_generated_path(directory, recreate=True)
+        cleaned[directory.name] = usage
+        total_files += usage["files"]
+        total_bytes += usage["bytes"]
+    return {
+        "cleaned": cleaned,
+        "filesDeleted": total_files,
+        "bytesFreed": total_bytes,
+        "uploadsPreserved": True,
+    }
+
+
 @app.on_event("startup")
 def startup() -> None:
     load_video_records()
@@ -246,6 +312,31 @@ def status() -> dict:
 @app.get("/api/videos")
 def list_videos() -> dict:
     return {"videos": list(videos.values())}
+
+
+@app.post("/api/open-output-folder")
+def open_output_folder() -> dict:
+    try:
+        open_local_folder(EXPORT_DIR)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Could not open output folder: {exc}") from exc
+    return {"path": str(EXPORT_DIR)}
+
+
+@app.post("/api/cleanup-generated")
+def cleanup_generated() -> dict:
+    with jobs_lock:
+        active_jobs = [job.id for job in jobs.values() if job.status in {"queued", "running"}]
+    if active_jobs:
+        raise HTTPException(status_code=409, detail="Cannot clean generated files while an export is running")
+    try:
+        result = clear_generated_dirs()
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Cleanup failed: {exc}") from exc
+    with jobs_lock:
+        jobs.clear()
+    cancelled_jobs.clear()
+    return result
 
 
 @app.post("/api/videos")
@@ -303,7 +394,29 @@ def run_export(job_id: str, request: ExportRequest) -> None:
         record = get_video(request.videoId)
         source = Path(record["path"])
         metadata = record["metadata"]
+        expected_count = int(metadata.get("frameCount") or 0)
+        fps = float(metadata.get("fps") or 30.0)
         cache_key = enhancement_cache_key(record, request)
+        output_path = export_output_path(record, cache_key, request)
+        if job_id in cancelled_jobs:
+            update_job(job_id, status="cancelled", progress=0, message="Stopped before export started")
+            cancelled_jobs.discard(job_id)
+            return
+        if output_path.exists() and output_path.stat().st_size > 0:
+            update_job(
+                job_id,
+                status="done",
+                progress=1.0,
+                message="Done. Reused cached H.264 output",
+                etaSeconds=0,
+                framesDone=expected_count,
+                framesTotal=expected_count,
+                cacheKey=cache_key,
+                outputUrl=f"/media/exports/{output_path.name}",
+                outputPath=str(output_path),
+            )
+            return
+
         cache_root = CACHE_DIR / cache_key
         raw_frames = cache_root / "frames"
         enhanced_frames = cache_root / "enhanced"
@@ -322,10 +435,8 @@ def run_export(job_id: str, request: ExportRequest) -> None:
             cancelled_jobs.discard(job_id)
             return
 
-        expected_count = int(metadata.get("frameCount") or 0)
         frames = reusable_frames(source, raw_frames, expected_count)
         total = len(frames)
-        fps = float(metadata.get("fps") or 30.0)
         settings = request.to_hypir()
         outputs = [(frame, enhanced_frames / frame.name) for frame in frames]
         missing_total = sum(1 for _, output in outputs if not valid_image(output))
@@ -390,25 +501,26 @@ def run_export(job_id: str, request: ExportRequest) -> None:
             )
 
         write_cache_manifest(cache_root, record, request, "complete")
-        output_path = export_output_path(record, cache_key, request)
-        if output_path.exists() and output_path.stat().st_size > 0:
-            selected_encoder = "cached H.264"
-            update_job(job_id, progress=0.96, message="Using cached H.264 output", etaSeconds=0)
-        else:
-            update_job(job_id, progress=0.92, message="Encoding H.264 video", etaSeconds=None)
-            selected_encoder = encode_video(
-                enhanced_frames,
-                source,
-                output_path,
-                fps=fps,
-                crf=request.crf,
-                encoder=request.encoder,
-            )
+        update_job(job_id, progress=0.92, message="Encoding H.264 video", etaSeconds=None)
+        selected_encoder = encode_video(
+            enhanced_frames,
+            source,
+            output_path,
+            fps=fps,
+            crf=request.crf,
+            encoder=request.encoder,
+        )
+        cleanup_message = "Cleaned intermediate frames"
+        try:
+            cleanup_usage = remove_generated_path(cache_root, recreate=False)
+            cleanup_message = f"Cleaned {cleanup_usage['files']} intermediate files"
+        except Exception as exc:
+            cleanup_message = f"Intermediate cleanup failed: {exc}"
         update_job(
             job_id,
             status="done",
             progress=1.0,
-            message=f"Done. Encoded with {selected_encoder}",
+            message=f"Done. Encoded with {selected_encoder}. {cleanup_message}",
             etaSeconds=0,
             framesDone=total,
             framesTotal=total,

@@ -36,6 +36,8 @@ const els = {
   durationTime: document.querySelector("#durationTime"),
   exportButton: document.querySelector("#exportButton"),
   cancelExportButton: document.querySelector("#cancelExportButton"),
+  openOutputFolderButton: document.querySelector("#openOutputFolderButton"),
+  clearGeneratedButton: document.querySelector("#clearGeneratedButton"),
   activityText: document.querySelector("#activityText"),
   frameProgressText: document.querySelector("#frameProgressText"),
   etaText: document.querySelector("#etaText"),
@@ -59,12 +61,71 @@ const els = {
   crfValue: document.querySelector("#crfValue"),
 };
 
+const tooltip = document.createElement("div");
+tooltip.className = "tooltip-popover";
+tooltip.setAttribute("role", "tooltip");
+document.body.appendChild(tooltip);
+
 function formatTime(seconds) {
   const safe = Number.isFinite(seconds) ? Math.max(0, seconds) : 0;
   const minutes = Math.floor(safe / 60);
   const secs = Math.floor(safe % 60);
   const ms = Math.floor((safe - Math.floor(safe)) * 1000);
   return `${String(minutes).padStart(2, "0")}:${String(secs).padStart(2, "0")}.${String(ms).padStart(3, "0")}`;
+}
+
+function hideTooltip() {
+  tooltip.classList.remove("visible");
+  tooltip.textContent = "";
+  document.querySelectorAll(".help-button.tooltip-active").forEach((button) => {
+    button.classList.remove("tooltip-active");
+  });
+}
+
+function showTooltip(button) {
+  const text = button.dataset.tooltip;
+  if (!text) return;
+
+  document.querySelectorAll(".help-button.tooltip-active").forEach((activeButton) => {
+    if (activeButton !== button) activeButton.classList.remove("tooltip-active");
+  });
+  button.classList.add("tooltip-active");
+  tooltip.textContent = text;
+  tooltip.style.left = "0px";
+  tooltip.style.top = "0px";
+  tooltip.classList.add("visible");
+
+  const buttonRect = button.getBoundingClientRect();
+  const tooltipRect = tooltip.getBoundingClientRect();
+  const margin = 12;
+  const left = Math.min(
+    window.innerWidth - tooltipRect.width - margin,
+    Math.max(margin, buttonRect.left)
+  );
+  let top = buttonRect.bottom + 8;
+  if (top + tooltipRect.height > window.innerHeight - margin) {
+    top = Math.max(margin, buttonRect.top - tooltipRect.height - 8);
+  }
+
+  tooltip.style.left = `${left}px`;
+  tooltip.style.top = `${top}px`;
+}
+
+function setupTooltips() {
+  document.querySelectorAll(".help-button").forEach((button) => {
+    button.addEventListener("mouseenter", () => showTooltip(button));
+    button.addEventListener("mouseleave", hideTooltip);
+    button.addEventListener("focus", () => showTooltip(button));
+    button.addEventListener("blur", hideTooltip);
+    button.addEventListener("keydown", (event) => {
+      if (event.key === "Escape") {
+        hideTooltip();
+        button.blur();
+      }
+    });
+  });
+  window.addEventListener("scroll", hideTooltip, true);
+  window.addEventListener("resize", hideTooltip);
 }
 
 function formatDuration(seconds) {
@@ -80,6 +141,19 @@ function formatDuration(seconds) {
     return `${minutes}m ${String(secs).padStart(2, "0")}s`;
   }
   return `${secs}s`;
+}
+
+function formatBytes(bytes) {
+  const safe = Number.isFinite(bytes) ? Math.max(0, bytes) : 0;
+  const units = ["B", "KB", "MB", "GB", "TB"];
+  let value = safe;
+  let unitIndex = 0;
+  while (value >= 1024 && unitIndex < units.length - 1) {
+    value /= 1024;
+    unitIndex += 1;
+  }
+  const digits = value >= 10 || unitIndex === 0 ? 0 : 1;
+  return `${value.toFixed(digits)} ${units[unitIndex]}`;
 }
 
 function setActivity(message, progress = null) {
@@ -186,6 +260,31 @@ function updateScaleMode() {
   els.upscaleField.classList.toggle("hidden", customTargetMode || fixedTargetMode);
 }
 
+function resetGeneratedUi() {
+  state.currentJobId = null;
+  state.liveOriginalUrl = null;
+  state.liveEnhancedUrl = null;
+  els.downloadLink.hidden = true;
+  els.downloadLink.removeAttribute("href");
+  els.originalPreview.hidden = true;
+  els.originalPreview.removeAttribute("src");
+  els.enhancedPreview.hidden = true;
+  els.enhancedPreview.removeAttribute("src");
+  els.enhancedEmpty.hidden = false;
+  if (state.video) {
+    els.sourceVideo.hidden = false;
+    els.originalEmpty.hidden = true;
+  } else {
+    els.sourceVideo.hidden = true;
+    els.originalEmpty.hidden = false;
+  }
+  els.originalInfo.textContent = "source frame";
+  els.enhancedInfo.textContent = "HYPIR preview";
+  els.frameProgressText.textContent = "Frames: --";
+  els.etaText.textContent = "ETA: --";
+  els.jobProgress.style.width = "0%";
+}
+
 function setVideo(record, { persist = true } = {}) {
   state.video = record;
   state.liveOriginalUrl = null;
@@ -256,6 +355,7 @@ function setExportEnabled(enabled) {
   els.exportButton.disabled = !enabled || !state.video || state.exportInFlight || state.previewInFlight;
   els.cancelExportButton.hidden = !state.exportInFlight;
   els.cancelExportButton.disabled = !state.exportInFlight;
+  els.clearGeneratedButton.disabled = state.exportInFlight || state.previewInFlight;
 }
 
 function scheduleAutoPreview({ delay = 450, reason = "settings changed" } = {}) {
@@ -349,6 +449,44 @@ async function cancelExport() {
   } catch (error) {
     setActivity(`Stop failed: ${error.message}`, null);
     els.cancelExportButton.disabled = false;
+  }
+}
+
+async function openOutputFolder() {
+  els.openOutputFolderButton.disabled = true;
+  try {
+    const result = await api("/api/open-output-folder", { method: "POST" });
+    setActivity(`Opened output folder: ${result.path}`, null);
+  } catch (error) {
+    setActivity(`Could not open output folder: ${error.message}`, null);
+  } finally {
+    els.openOutputFolderButton.disabled = false;
+  }
+}
+
+async function clearGeneratedFiles() {
+  if (state.exportInFlight || state.previewInFlight) return;
+  const confirmed = window.confirm(
+    "Delete all generated videos, preview images, cached frames, and job files? Source uploads will stay."
+  );
+  if (!confirmed) return;
+
+  window.clearTimeout(state.previewTimer);
+  state.previewDirty = false;
+  els.clearGeneratedButton.disabled = true;
+  setActivity("Cleaning generated files", null);
+  try {
+    const result = await api("/api/cleanup-generated", { method: "POST" });
+    resetGeneratedUi();
+    setActivity(
+      `Cleaned ${result.filesDeleted} generated files (${formatBytes(result.bytesFreed)} freed). Source uploads preserved.`,
+      0
+    );
+    await refreshStatus();
+  } catch (error) {
+    setActivity(`Cleanup failed: ${error.message}`, null);
+  } finally {
+    setExportEnabled(true);
   }
 }
 
@@ -468,6 +606,8 @@ els.sourceVideo.addEventListener("seeked", () => {
 
 els.exportButton.addEventListener("click", startExport);
 els.cancelExportButton.addEventListener("click", cancelExport);
+els.openOutputFolderButton.addEventListener("click", openOutputFolder);
+els.clearGeneratedButton.addEventListener("click", clearGeneratedFiles);
 els.refreshStatusButton.addEventListener("click", refreshStatus);
 els.scaleBy.addEventListener("change", () => {
   updateScaleMode();
@@ -507,5 +647,6 @@ els.crf.addEventListener("input", () => {
 });
 
 updateScaleMode();
+setupTooltips();
 refreshStatus();
 restoreSession();

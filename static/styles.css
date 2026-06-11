@@ -402,11 +402,14 @@ svg {
 .timeline-actions {
   display: flex;
   align-items: center;
+  flex-wrap: wrap;
   gap: 10px;
   margin-top: 11px;
 }
 
 .timeline-actions #activityText {
+  flex: 1 1 180px;
+  min-width: 160px;
   overflow: hidden;
   color: var(--muted);
   font-size: 12px;
@@ -494,20 +497,24 @@ svg {
   padding: 0;
 }
 
-.help-button::after {
-  position: absolute;
-  z-index: 20;
-  top: calc(100% + 8px);
-  left: 0;
+.help-button.tooltip-active,
+.help-button:focus-visible {
+  border-color: var(--accent);
+  color: var(--accent);
+  outline: none;
+}
+
+.tooltip-popover {
+  position: fixed;
+  z-index: 1000;
   display: none;
-  width: min(260px, calc(100vw - 44px));
+  width: min(280px, calc(100vw - 24px));
   padding: 10px 11px;
   border: 1px solid #4b5156;
   border-radius: 8px;
   background: #0f1112;
   box-shadow: 0 14px 40px rgba(0, 0, 0, 0.42);
   color: var(--text);
-  content: attr(data-tooltip);
   font-size: 12px;
   font-weight: 560;
   line-height: 1.45;
@@ -516,15 +523,7 @@ svg {
   white-space: normal;
 }
 
-.help-button:hover,
-.help-button:focus-visible {
-  border-color: var(--accent);
-  color: var(--accent);
-  outline: none;
-}
-
-.help-button:hover::after,
-.help-button:focus-visible::after {
+.tooltip-popover.visible {
   display: block;
 }
 

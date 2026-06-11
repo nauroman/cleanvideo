@@ -105,6 +105,14 @@
               <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 6l12 12M18 6 6 18"/></svg>
               Stop Export
             </button>
+            <button id="openOutputFolderButton" class="secondary-button" type="button">
+              <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 7h7l2 2h9v9a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/></svg>
+              Open Output Folder
+            </button>
+            <button id="clearGeneratedButton" class="danger-button" type="button">
+              <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7h16M10 11v6M14 11v6M6 7l1 14h10l1-14M9 7V4h6v3"/></svg>
+              Clear Generated Files
+            </button>
             <span id="activityText">Idle</span>
           </div>
           <div class="progress-meta">
@@ -121,7 +129,7 @@
       <aside class="inspector" aria-label="Settings">
         <section class="panel">
           <h2>Resolution</h2>
-          <label class="field">
+          <div class="field">
             <span class="field-label">
               Scale Mode
               <button
@@ -131,7 +139,7 @@
                 data-tooltip="Choose the output size. Scale factor multiplies the video dimensions, while 720p, Full HD, 4K, and 8K resize the longest side to a standard target and keep the original aspect ratio. Example: a 1920x1080 video with 4K becomes about 3840x2160."
               >?</button>
             </span>
-            <select id="scaleBy">
+            <select id="scaleBy" aria-label="Scale Mode">
               <option value="factor">Scale factor</option>
               <option value="preset_720p">720p</option>
               <option value="preset_fullhd">Full HD</option>
@@ -139,8 +147,8 @@
               <option value="preset_8k">8K</option>
               <option value="longest_side">Target longest side</option>
             </select>
-          </label>
-          <label id="upscaleField" class="field">
+          </div>
+          <div id="upscaleField" class="field">
             <span class="field-label">
               Upscale
               <button
@@ -150,14 +158,14 @@
                 data-tooltip="Multiplies the original width and height. 1x keeps the same resolution, 2x doubles both dimensions, and 4x makes each frame much larger. Higher values take much longer and use more VRAM."
               >?</button>
             </span>
-            <select id="upscale">
+            <select id="upscale" aria-label="Upscale">
               <option value="1">1x</option>
               <option value="2">2x</option>
               <option value="3">3x</option>
               <option value="4">4x</option>
             </select>
-          </label>
-          <label id="targetField" class="field hidden">
+          </div>
+          <div id="targetField" class="field hidden">
             <span class="field-label">
               Longest Side
               <button
@@ -167,13 +175,13 @@
                 data-tooltip="Sets the longest edge of the output frame while preserving aspect ratio. Example: 1920 makes landscape video close to 1920x1080 and portrait video close to 1080x1920."
               >?</button>
             </span>
-            <input id="targetLongestSide" type="number" min="256" max="8192" step="64" value="1920" />
-          </label>
+            <input id="targetLongestSide" type="number" min="256" max="8192" step="64" value="1920" aria-label="Longest Side" />
+          </div>
         </section>
 
         <section class="panel">
           <h2>HYPIR Quality</h2>
-          <label class="field">
+          <div class="field">
             <span class="field-label">
               Patch Size
               <button
@@ -183,13 +191,13 @@
                 data-tooltip="The tile size HYPIR processes at one time. 512 is safest and uses less VRAM. 768 or 1024 can improve consistency on large frames but may be slower or run out of GPU memory."
               >?</button>
             </span>
-            <select id="patchSize">
+            <select id="patchSize" aria-label="Patch Size">
               <option value="512">512</option>
               <option value="768">768</option>
               <option value="1024">1024</option>
             </select>
-          </label>
-          <label class="field">
+          </div>
+          <div class="field">
             <span class="field-label">
               Stride
               <button
@@ -199,14 +207,14 @@
                 data-tooltip="How far the tile moves before HYPIR processes the next tile. Smaller stride means more overlap, fewer tile seams, and slower export. Larger stride is faster but can make tile boundaries more visible. A good starting point is half the patch size, such as 512 patch with 256 stride."
               >?</button>
             </span>
-            <select id="stride">
+            <select id="stride" aria-label="Stride">
               <option value="256">256</option>
               <option value="384">384</option>
               <option value="512">512</option>
               <option value="768">768</option>
             </select>
-          </label>
-          <label class="field">
+          </div>
+          <div class="field">
             <span class="field-label">
               Seed
               <button
@@ -216,9 +224,9 @@
                 data-tooltip="The random number used by the AI. Keep the same seed to make previews and exports repeatable. Change it if the result looks strange and you want a different interpretation. Use -1 for a random seed."
               >?</button>
             </span>
-            <input id="seed" type="number" value="231" />
-          </label>
-          <label class="field">
+            <input id="seed" type="number" value="231" aria-label="Seed" />
+          </div>
+          <div class="field">
             <span class="field-label">
               Prompt
               <button
@@ -228,13 +236,13 @@
                 data-tooltip="A short description of the look you want. Keep it simple and visual. Examples: 'natural film detail, clean faces, sharp edges' or 'anime frame, clean line art, crisp texture'. Avoid asking for content that is not already in the video."
               >?</button>
             </span>
-            <textarea id="prompt" rows="4" spellcheck="false">high quality, sharp details, natural texture</textarea>
-          </label>
+            <textarea id="prompt" rows="4" spellcheck="false" aria-label="Prompt">high quality, sharp details, natural texture</textarea>
+          </div>
         </section>
 
         <section class="panel">
           <h2>H.264 Export</h2>
-          <label class="field">
+          <div class="field">
             <span class="field-label">
               Encoder
               <button
@@ -244,13 +252,13 @@
                 data-tooltip="Chooses how the final H.264 MP4 is encoded. Auto uses NVIDIA NVENC when available, which is fast on your GPU. NVIDIA NVENC is fastest. CPU libx264 can be smaller or more compatible, but it is much slower."
               >?</button>
             </span>
-            <select id="encoder">
+            <select id="encoder" aria-label="Encoder">
               <option value="auto">Auto</option>
               <option value="h264_nvenc">NVIDIA NVENC</option>
               <option value="libx264">CPU libx264</option>
             </select>
-          </label>
-          <label class="field">
+          </div>
+          <div class="field">
             <span class="field-label">
               Quality CRF/CQ
               <button
@@ -260,9 +268,9 @@
                 data-tooltip="Controls final MP4 compression quality. Lower numbers mean better quality and larger files. 18 is a good high-quality default, 23 is smaller, and 12 is very high quality with very large files. NVENC uses this as CQ; libx264 uses it as CRF."
               >?</button>
             </span>
-            <input id="crf" type="range" min="12" max="32" step="1" value="18" />
+            <input id="crf" type="range" min="12" max="32" step="1" value="18" aria-label="Quality CRF/CQ" />
             <output id="crfValue">18</output>
-          </label>
+          </div>
         </section>
       </aside>
     </main>
