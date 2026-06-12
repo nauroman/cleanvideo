@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from importlib import metadata
 from pathlib import Path
 
+import numpy as np
 from PIL import Image
 
 
@@ -36,6 +37,7 @@ LORA_MODULES = [
 
 @dataclass(frozen=True)
 class AdapterDataset:
+    candidates: int
     frames: int
     patches: int
     parquet_path: Path
@@ -53,6 +55,8 @@ def build_adapter_dataset(
     max_frames: int,
     patches_per_frame: int,
     max_train_steps: int,
+    checkpointing_steps: int,
+    checkpoints_total_limit: int,
 ) -> AdapterDataset:
     validate_training_dependencies()
     source_frames_dir = adapter_root / "source_frames"
@@ -63,7 +67,9 @@ def build_adapter_dataset(
             shutil.rmtree(directory)
         directory.mkdir(parents=True, exist_ok=True)
 
-    extracted = extract_sample_frames(video_path, source_frames_dir, duration_seconds, max_frames)
+    candidate_count = min(max(max_frames * 3, max_frames), max_frames + 256)
+    candidates = extract_sample_frames(video_path, source_frames_dir, duration_seconds, candidate_count)
+    extracted = select_training_frames(candidates, max_frames)
     patch_paths = write_training_patches(
         frame_paths=extracted,
         patches_dir=patches_dir,
@@ -81,20 +87,26 @@ def build_adapter_dataset(
         parquet_path=parquet_path,
         base_model_path=base_model_path,
         max_train_steps=max_train_steps,
+        checkpointing_steps=checkpointing_steps,
+        checkpoints_total_limit=checkpoints_total_limit,
     )
     (adapter_root / "dataset.json").write_text(
         json.dumps(
             {
+                "candidates": len(candidates),
                 "frames": len(extracted),
                 "patches": len(patch_paths),
                 "prompt": prompt,
                 "maxTrainSteps": max_train_steps,
+                "checkpointingSteps": checkpointing_steps,
+                "checkpointsTotalLimit": checkpoints_total_limit,
             },
             indent=2,
         ),
         encoding="utf-8",
     )
     return AdapterDataset(
+        candidates=len(candidates),
         frames=len(extracted),
         patches=len(patch_paths),
         parquet_path=parquet_path,
@@ -154,6 +166,91 @@ def extract_sample_frames(
     return frames
 
 
+@dataclass(frozen=True)
+class FrameAnalysis:
+    path: Path
+    brightness: float
+    contrast: float
+    sharpness: float
+    signature: int
+
+    @property
+    def usable(self) -> bool:
+        return 16 <= self.brightness <= 240 and self.contrast >= 8 and self.sharpness >= 12
+
+
+def analyze_frame(frame_path: Path) -> FrameAnalysis:
+    image = Image.open(frame_path).convert("L")
+    analysis = image.copy()
+    analysis.thumbnail((256, 256), Image.Resampling.BICUBIC)
+    pixels = np.asarray(analysis, dtype=np.float32)
+    brightness = float(pixels.mean())
+    contrast = float(pixels.std())
+    sharpness = laplacian_variance(pixels)
+    signature = average_hash(image)
+    return FrameAnalysis(
+        path=frame_path,
+        brightness=brightness,
+        contrast=contrast,
+        sharpness=sharpness,
+        signature=signature,
+    )
+
+
+def laplacian_variance(pixels: np.ndarray) -> float:
+    center = pixels[1:-1, 1:-1] * 4
+    laplacian = center - pixels[:-2, 1:-1] - pixels[2:, 1:-1] - pixels[1:-1, :-2] - pixels[1:-1, 2:]
+    return float(laplacian.var())
+
+
+def average_hash(image: Image.Image) -> int:
+    thumbnail = image.resize((8, 8), Image.Resampling.BICUBIC)
+    pixels = np.asarray(thumbnail, dtype=np.float32)
+    threshold = float(pixels.mean())
+    signature = 0
+    for index, value in enumerate(pixels.flatten()):
+        if value >= threshold:
+            signature |= 1 << index
+    return signature
+
+
+def hamming_distance(left: int, right: int) -> int:
+    return (left ^ right).bit_count()
+
+
+def select_training_frames(frame_paths: list[Path], max_frames: int) -> list[Path]:
+    analyses = [analyze_frame(path) for path in frame_paths]
+    usable = [item for item in analyses if item.usable]
+    if len(usable) < max(4, max_frames // 4):
+        usable = analyses
+
+    unique: list[FrameAnalysis] = []
+    for item in usable:
+        if all(hamming_distance(item.signature, previous.signature) >= 7 for previous in unique):
+            unique.append(item)
+    if len(unique) < max(4, max_frames // 3):
+        unique = usable
+
+    selected = evenly_sample(unique, max_frames)
+    return [item.path for item in selected]
+
+
+def evenly_sample(items: list[FrameAnalysis], max_items: int) -> list[FrameAnalysis]:
+    if len(items) <= max_items:
+        return items
+    if max_items <= 1:
+        return items[:max_items]
+    selected: list[FrameAnalysis] = []
+    last_index = -1
+    for slot in range(max_items):
+        index = round(slot * (len(items) - 1) / (max_items - 1))
+        if index == last_index:
+            index = min(len(items) - 1, index + 1)
+        selected.append(items[index])
+        last_index = index
+    return selected
+
+
 def write_training_patches(
     *,
     frame_paths: list[Path],
@@ -164,7 +261,8 @@ def write_training_patches(
     for frame_index, frame_path in enumerate(frame_paths, start=1):
         image = Image.open(frame_path).convert("RGB")
         image = normalize_training_frame(image)
-        crop_boxes = crop_boxes_for(image.width, image.height, patches_per_frame)
+        candidate_boxes = crop_boxes_for(image.width, image.height, max(patches_per_frame * 4, patches_per_frame))
+        crop_boxes = select_crop_boxes(image, candidate_boxes, patches_per_frame)
         for crop_index, box in enumerate(crop_boxes, start=1):
             patch = image.crop(box)
             patch_path = patches_dir / f"patch_{frame_index:06d}_{crop_index:02d}.png"
@@ -194,10 +292,31 @@ def normalize_training_frame(image: Image.Image, max_longest_side: int = 1536) -
     return image
 
 
+def select_crop_boxes(
+    image: Image.Image,
+    candidate_boxes: list[tuple[int, int, int, int]],
+    count: int,
+) -> list[tuple[int, int, int, int]]:
+    scored = [(score_crop(image, box), box) for box in candidate_boxes]
+    scored.sort(key=lambda item: item[0], reverse=True)
+    return [box for _, box in scored[:count]]
+
+
+def score_crop(image: Image.Image, box: tuple[int, int, int, int]) -> float:
+    crop = image.crop(box).convert("L")
+    crop.thumbnail((160, 160), Image.Resampling.BICUBIC)
+    pixels = np.asarray(crop, dtype=np.float32)
+    brightness = float(pixels.mean())
+    contrast = float(pixels.std())
+    sharpness = laplacian_variance(pixels)
+    exposure_penalty = abs(brightness - 118) * 0.1
+    return contrast + math.sqrt(max(0.0, sharpness)) - exposure_penalty
+
+
 def crop_boxes_for(width: int, height: int, count: int) -> list[tuple[int, int, int, int]]:
     max_x = max(0, width - PATCH_SIZE)
     max_y = max(0, height - PATCH_SIZE)
-    candidates = [
+    positions = [
         (max_x // 2, max_y // 2),
         (0, 0),
         (max_x, 0),
@@ -208,18 +327,23 @@ def crop_boxes_for(width: int, height: int, count: int) -> list[tuple[int, int, 
         (max_x // 4, max_y * 3 // 4),
         (max_x * 3 // 4, max_y * 3 // 4),
     ]
+    grid_steps = max(2, math.ceil(math.sqrt(max(count, 1))) + 1)
+    for y_step in range(grid_steps):
+        for x_step in range(grid_steps):
+            x = round(max_x * x_step / max(1, grid_steps - 1))
+            y = round(max_y * y_step / max(1, grid_steps - 1))
+            positions.append((x, y))
+
     boxes: list[tuple[int, int, int, int]] = []
     seen: set[tuple[int, int]] = set()
-    for x, y in candidates:
+    for x, y in positions:
         x = min(max(0, x), max_x)
         y = min(max(0, y), max_y)
         if (x, y) in seen:
             continue
         seen.add((x, y))
         boxes.append((x, y, x + PATCH_SIZE, y + PATCH_SIZE))
-        if len(boxes) >= count:
-            break
-    return boxes
+    return boxes[:count]
 
 
 def write_parquet(patch_paths: list[Path], prompt: str, parquet_path: Path) -> None:
@@ -243,8 +367,9 @@ def write_train_config(
     parquet_path: Path,
     base_model_path: Path,
     max_train_steps: int,
+    checkpointing_steps: int,
+    checkpoints_total_limit: int,
 ) -> None:
-    checkpointing_steps = max(50, math.ceil(max_train_steps / 4))
     modules = "[" + ", ".join(LORA_MODULES) + "]"
     config_path.write_text(
         f"""output_dir: {output_dir.as_posix()}
@@ -334,7 +459,7 @@ max_grad_norm: 1.0
 logging_dir: logs
 report_to: ~
 checkpointing_steps: {checkpointing_steps}
-checkpoints_total_limit: 2
+checkpoints_total_limit: {checkpoints_total_limit}
 resume_from_checkpoint: ~
 log_image_steps: {max_train_steps + 1}
 log_grad_steps: {max_train_steps + 1}

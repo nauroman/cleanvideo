@@ -54,7 +54,11 @@ The `Temporal` export setting reduces frame-to-frame flicker by optical-flow war
 
 The `0.5x` scale factor performs high-quality Lanczos downscaling before HYPIR enhancement, producing half-width and half-height output while giving the generator a smaller, cleaner input.
 
-`Create Film Adapter` samples the selected video into 512x512 training patches, starts a local HYPIR LoRA fine-tune job, and saves the resulting adapter under `work/adapters`. Completed adapters appear in the `Film Adapter` selector and can be used by preview/export. Adapter training is experimental: it can take a long time, may overfit noisy footage, and `Clean All` does not delete completed adapters.
+`Create Film Adapter` samples the selected video into 512x512 training patches, starts a local HYPIR LoRA fine-tune job, and saves the resulting adapter under `work/adapters`. The `Adapter Quality` preset controls sampling and training length: `Fast` uses 32 selected frames, 3 patches per frame, and 300 steps; `High` uses 80 frames, 5 patches, and 900 steps; `Extra` uses 128 frames, 7 patches, and 1200 steps. The sampler extracts extra candidate frames, filters very dark, low-detail, or near-duplicate frames, and keeps multiple checkpoints so the `Film Adapter` selector can preview earlier/later steps.
+
+`Second Pass` can run `Base after adapter` for preview/export. This first enhances with the selected film adapter, then runs Base HYPIR at 1x as a refinement pass before temporal stabilization. It is experimental and much slower, but useful to compare when an adapter preserves film style well and Base HYPIR adds cleaner detail on top. Adapter training is experimental: it can take a long time, may overfit noisy footage, and `Clean All` does not delete completed adapters.
+
+Use the trash button next to `Film Adapter` to delete a completed adapter, or `Delete All Adapters` to remove every film adapter at once. Deleting adapters removes checkpoints, patches, sampled frames, logs, and metadata under `work/adapters`; `Base HYPIR` cannot be deleted.
 
 ## Reinstall dependencies
 

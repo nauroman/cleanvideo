@@ -10,6 +10,8 @@ const state = {
   adapterInFlight: false,
   currentAdapterJobId: null,
   adapterTimer: null,
+  adapters: [],
+  adaptersById: new Map(),
   liveOriginalUrl: null,
   liveEnhancedUrl: null,
   frameEventQueue: [],
@@ -64,6 +66,10 @@ const els = {
   stride: document.querySelector("#stride"),
   temporalConsistency: document.querySelector("#temporalConsistency"),
   adapterSelect: document.querySelector("#adapterSelect"),
+  secondPass: document.querySelector("#secondPass"),
+  adapterQuality: document.querySelector("#adapterQuality"),
+  deleteAdapterButton: document.querySelector("#deleteAdapterButton"),
+  deleteAllAdaptersButton: document.querySelector("#deleteAllAdaptersButton"),
   trainAdapterButton: document.querySelector("#trainAdapterButton"),
   cancelAdapterButton: document.querySelector("#cancelAdapterButton"),
   seed: document.querySelector("#seed"),
@@ -184,6 +190,8 @@ function collectUiSettings() {
     stride: els.stride.value,
     temporalConsistency: els.temporalConsistency.value,
     adapterId: els.adapterSelect.value,
+    secondPass: els.secondPass.value,
+    adapterQuality: els.adapterQuality.value,
     seed: els.seed.value,
     prompt: els.prompt.value,
     encoder: els.encoder.value,
@@ -218,6 +226,8 @@ function applySavedSettings(settings = {}) {
     ["stride", els.stride],
     ["temporalConsistency", els.temporalConsistency],
     ["adapterId", els.adapterSelect],
+    ["secondPass", els.secondPass],
+    ["adapterQuality", els.adapterQuality],
     ["seed", els.seed],
     ["prompt", els.prompt],
     ["encoder", els.encoder],
@@ -234,6 +244,7 @@ function applySavedSettings(settings = {}) {
   }
   els.crfValue.textContent = els.crf.value;
   updateScaleMode();
+  updateDeleteAdapterButton();
 }
 
 async function api(path, options = {}) {
@@ -254,8 +265,10 @@ async function api(path, options = {}) {
 async function loadAdapters(selectedId = els.adapterSelect.value || "base") {
   const result = await api("/api/adapters");
   const ids = new Set();
+  state.adapters = result.adapters || [];
+  state.adaptersById = new Map(state.adapters.map((adapter) => [adapter.id, adapter]));
   els.adapterSelect.replaceChildren();
-  for (const adapter of result.adapters || []) {
+  for (const adapter of state.adapters) {
     ids.add(adapter.id);
     const option = document.createElement("option");
     option.value = adapter.id;
@@ -263,6 +276,55 @@ async function loadAdapters(selectedId = els.adapterSelect.value || "base") {
     els.adapterSelect.appendChild(option);
   }
   els.adapterSelect.value = ids.has(selectedId) ? selectedId : "base";
+  updateDeleteAdapterButton();
+}
+
+function selectedAdapterRecord() {
+  return state.adaptersById.get(els.adapterSelect.value) || null;
+}
+
+function selectedRootAdapterRecord() {
+  const selected = selectedAdapterRecord();
+  if (!selected || selected.id === "base") return null;
+  const rootId = selected.parentAdapterId || selected.id.split("@step-")[0];
+  return state.adaptersById.get(rootId) || selected;
+}
+
+function canDeleteSelectedAdapter() {
+  return Boolean(
+    selectedRootAdapterRecord()
+    && !state.exportInFlight
+    && !state.previewInFlight
+    && !state.adapterInFlight
+  );
+}
+
+function rootAdapterRecords() {
+  const roots = new Map();
+  for (const adapter of state.adapters) {
+    if (!adapter || adapter.id === "base" || adapter.parentAdapterId) continue;
+    roots.set(adapter.id, adapter);
+  }
+  return Array.from(roots.values());
+}
+
+function canDeleteAllAdapters() {
+  return rootAdapterRecords().length > 0
+    && !state.exportInFlight
+    && !state.previewInFlight
+    && !state.adapterInFlight;
+}
+
+function updateDeleteAdapterButton() {
+  const rootAdapter = selectedRootAdapterRecord();
+  els.deleteAdapterButton.disabled = !canDeleteSelectedAdapter();
+  els.deleteAdapterButton.title = rootAdapter
+    ? `Delete ${rootAdapter.name || rootAdapter.id}`
+    : "Base HYPIR cannot be deleted";
+  els.deleteAllAdaptersButton.disabled = !canDeleteAllAdapters();
+  els.deleteAllAdaptersButton.title = rootAdapterRecords().length
+    ? "Delete all film adapters"
+    : "No film adapters to delete";
 }
 
 function collectSettings() {
@@ -285,6 +347,7 @@ function collectSettings() {
     stride,
     temporalConsistency: els.temporalConsistency.value,
     adapterId: els.adapterSelect.value,
+    secondPass: els.secondPass.value,
     seed: Number(els.seed.value),
     device: "cuda",
   };
@@ -492,6 +555,7 @@ function setExportEnabled(enabled) {
   els.cancelAdapterButton.hidden = !state.adapterInFlight;
   els.cancelAdapterButton.disabled = !state.adapterInFlight;
   els.clearGeneratedButton.disabled = state.exportInFlight || state.previewInFlight || state.adapterInFlight;
+  updateDeleteAdapterButton();
 }
 
 function scheduleAutoPreview({ delay = 450, reason = "settings changed" } = {}) {
@@ -530,7 +594,8 @@ async function runAutoPreview() {
     els.originalEmpty.hidden = true;
     els.enhancedEmpty.hidden = true;
     els.originalInfo.textContent = formatTime(preview.seconds);
-    els.enhancedInfo.textContent = `${preview.result.width}x${preview.result.height} | seed ${preview.result.seed}`;
+    const passText = preview.passes === 2 ? " | 2 passes" : "";
+    els.enhancedInfo.textContent = `${preview.result.width}x${preview.result.height} | seed ${preview.result.seed}${passText}`;
     setActivity("Preview ready", 1);
     await refreshStatus();
   } catch (error) {
@@ -596,9 +661,7 @@ async function startAdapterTraining() {
       body: JSON.stringify({
         videoId: state.video.id,
         prompt: els.prompt.value || "film-specific restoration, natural detail, consistent texture",
-        maxFrames: 32,
-        patchesPerFrame: 3,
-        maxTrainSteps: 300,
+        quality: els.adapterQuality.value,
       }),
     });
     state.currentAdapterJobId = job.id;
@@ -622,6 +685,68 @@ async function cancelAdapterTraining() {
   } catch (error) {
     setActivity(`Stop failed: ${error.message}`, null);
     els.cancelAdapterButton.disabled = false;
+  }
+}
+
+async function deleteSelectedAdapter() {
+  const selected = selectedAdapterRecord();
+  const rootAdapter = selectedRootAdapterRecord();
+  if (!selected || !rootAdapter || !canDeleteSelectedAdapter()) return;
+
+  const rootId = rootAdapter.parentAdapterId || rootAdapter.id.split("@step-")[0];
+  const confirmed = window.confirm(
+    `Delete film adapter "${rootAdapter.name || rootId}" and all of its checkpoints, patches, sampled frames, and logs? This cannot be undone.`
+  );
+  if (!confirmed) return;
+
+  els.deleteAdapterButton.disabled = true;
+  setActivity("Deleting film adapter", null);
+  try {
+    const result = await api(`/api/adapters/${encodeURIComponent(selected.id)}`, { method: "DELETE" });
+    await loadAdapters("base");
+    saveLocalState();
+    setActivity(
+      `Deleted adapter: ${result.filesDeleted} files and ${result.directoriesDeleted} folders (${formatBytes(result.bytesFreed)} freed).`,
+      null
+    );
+    if (state.video) {
+      scheduleAutoPreview({ delay: 300, reason: "film adapter deleted" });
+    }
+    await refreshStatus();
+  } catch (error) {
+    setActivity(`Delete adapter failed: ${error.message}`, null);
+  } finally {
+    setExportEnabled(true);
+  }
+}
+
+async function deleteAllAdapters() {
+  const adapterCount = rootAdapterRecords().length;
+  if (!canDeleteAllAdapters()) return;
+  const confirmed = window.confirm(
+    `Delete all ${adapterCount} film adapter${adapterCount === 1 ? "" : "s"} and every checkpoint, patch, sampled frame, and log under work/adapters? Base HYPIR will stay. This cannot be undone.`
+  );
+  if (!confirmed) return;
+
+  els.deleteAllAdaptersButton.disabled = true;
+  els.deleteAdapterButton.disabled = true;
+  setActivity("Deleting all film adapters", null);
+  try {
+    const result = await api("/api/adapters", { method: "DELETE" });
+    await loadAdapters("base");
+    saveLocalState();
+    setActivity(
+      `Deleted ${result.adaptersDeleted} adapters: ${result.filesDeleted} files and ${result.directoriesDeleted} folders (${formatBytes(result.bytesFreed)} freed).`,
+      null
+    );
+    if (state.video) {
+      scheduleAutoPreview({ delay: 300, reason: "film adapters deleted" });
+    }
+    await refreshStatus();
+  } catch (error) {
+    setActivity(`Delete all adapters failed: ${error.message}`, null);
+  } finally {
+    setExportEnabled(true);
   }
 }
 
@@ -941,6 +1066,8 @@ els.exportButton.addEventListener("click", startExport);
 els.cancelExportButton.addEventListener("click", cancelExport);
 els.trainAdapterButton.addEventListener("click", startAdapterTraining);
 els.cancelAdapterButton.addEventListener("click", cancelAdapterTraining);
+els.deleteAdapterButton.addEventListener("click", deleteSelectedAdapter);
+els.deleteAllAdaptersButton.addEventListener("click", deleteAllAdapters);
 els.openOutputFolderButton.addEventListener("click", openOutputFolder);
 els.clearGeneratedButton.addEventListener("click", clearGeneratedFiles);
 els.refreshStatusButton.addEventListener("click", refreshStatus);
@@ -969,9 +1096,15 @@ els.stride.addEventListener("change", () => {
 });
 els.temporalConsistency.addEventListener("change", saveLocalState);
 els.adapterSelect.addEventListener("change", () => {
+  updateDeleteAdapterButton();
   saveLocalState();
   scheduleAutoPreview({ delay: 300, reason: "film adapter changed" });
 });
+els.secondPass.addEventListener("change", () => {
+  saveLocalState();
+  scheduleAutoPreview({ delay: 300, reason: "second pass changed" });
+});
+els.adapterQuality.addEventListener("change", saveLocalState);
 els.seed.addEventListener("input", () => {
   saveLocalState();
   scheduleAutoPreview();

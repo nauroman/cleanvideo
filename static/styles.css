@@ -252,6 +252,12 @@ button {
   padding: 0 14px;
 }
 
+.icon-button {
+  width: 38px;
+  min-width: 38px;
+  padding: 0;
+}
+
 .primary-button:disabled,
 .secondary-button:disabled,
 .danger-button:disabled {
@@ -539,6 +545,13 @@ svg {
 
 .field:last-child {
   margin-bottom: 0;
+}
+
+.adapter-select-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 38px;
+  gap: 8px;
+  align-items: center;
 }
 
 .adapter-actions {

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import hashlib
+import math
 import os
 import shutil
 import stat
@@ -47,7 +48,30 @@ ADAPTER_DIR = WORK_DIR / "adapters"
 for directory in [UPLOAD_DIR, PREVIEW_DIR, EXPORT_DIR, JOB_DIR, CACHE_DIR, ADAPTER_DIR]:
     directory.mkdir(parents=True, exist_ok=True)
 GENERATED_DIRS = [PREVIEW_DIR, CACHE_DIR, JOB_DIR, EXPORT_DIR]
-APP_BUILD = "2026-06-11-film-adapter-v1"
+APP_BUILD = "2026-06-11-film-adapter-v4"
+
+AdapterQuality = Literal["fast", "high", "extra"]
+SecondPassMode = Literal["off", "base_after_adapter"]
+ADAPTER_QUALITY_PRESETS: dict[str, dict[str, int]] = {
+    "fast": {
+        "maxFrames": 32,
+        "patchesPerFrame": 3,
+        "maxTrainSteps": 300,
+        "checkpointsTotalLimit": 2,
+    },
+    "high": {
+        "maxFrames": 80,
+        "patchesPerFrame": 5,
+        "maxTrainSteps": 900,
+        "checkpointsTotalLimit": 4,
+    },
+    "extra": {
+        "maxFrames": 128,
+        "patchesPerFrame": 7,
+        "maxTrainSteps": 1200,
+        "checkpointsTotalLimit": 5,
+    },
+}
 
 
 class ProcessSettings(BaseModel):
@@ -61,6 +85,7 @@ class ProcessSettings(BaseModel):
     seed: int = Field(default=231, ge=-1)
     temporalConsistency: TemporalConsistency = "medium"
     adapterId: str = "base"
+    secondPass: SecondPassMode = "off"
     device: Literal["cuda"] = "cuda"
 
     def to_hypir(self, adapter_weight_path: Path | None = None) -> HypirSettings:
@@ -74,6 +99,19 @@ class ProcessSettings(BaseModel):
             seed=self.seed,
             device=self.device,
             weight_path=str(adapter_weight_path) if adapter_weight_path else None,
+        )
+
+    def to_base_refine_hypir(self) -> HypirSettings:
+        return HypirSettings(
+            prompt=self.prompt.strip(),
+            scale_by="factor",
+            upscale=1,
+            target_longest_side=None,
+            patch_size=self.patchSize,
+            stride=self.stride,
+            seed=self.seed,
+            device=self.device,
+            weight_path=None,
         )
 
 
@@ -91,9 +129,10 @@ class ExportRequest(ProcessSettings):
 class AdapterTrainRequest(BaseModel):
     videoId: str
     prompt: str = "film-specific restoration, natural detail, consistent texture"
-    maxFrames: int = Field(default=32, ge=4, le=240)
-    patchesPerFrame: int = Field(default=3, ge=1, le=9)
-    maxTrainSteps: int = Field(default=300, ge=20, le=3000)
+    quality: AdapterQuality = "fast"
+    maxFrames: int | None = Field(default=None, ge=4, le=240)
+    patchesPerFrame: int | None = Field(default=None, ge=1, le=9)
+    maxTrainSteps: int | None = Field(default=None, ge=20, le=3000)
 
 
 class JobState(BaseModel):
@@ -185,6 +224,23 @@ def adapter_meta_path(adapter_id: str) -> Path:
     return ADAPTER_DIR / adapter_id / "adapter.json"
 
 
+def root_adapter_id(adapter_id: str) -> str:
+    return adapter_id.split("@step-", 1)[0]
+
+
+def resolve_repo_path(path: Path) -> Path:
+    if path.is_absolute():
+        return path
+    return (ROOT / path).resolve()
+
+
+def ensure_adapter_path(path: Path) -> None:
+    root = ADAPTER_DIR.resolve()
+    resolved = path.resolve()
+    if resolved == root or root not in resolved.parents:
+        raise ValueError(f"Refusing to delete outside adapter directory: {resolved}")
+
+
 def save_adapter_record(record: dict) -> None:
     path = adapter_meta_path(record["id"])
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -198,6 +254,15 @@ def load_adapter_records() -> None:
             record = json.loads(meta_path.read_text(encoding="utf-8"))
             weight_path = Path(record["weightPath"])
             if weight_path.exists():
+                if not record.get("checkpoints"):
+                    output_dir = Path(record.get("rootPath") or meta_path.parent) / "training"
+                    checkpoints = checkpoint_weights(output_dir)
+                    if checkpoints:
+                        record["checkpointStep"] = checkpoints[-1]["step"]
+                        record["checkpoints"] = [
+                            {"step": item["step"], "weightPath": str(item["weightPath"])}
+                            for item in checkpoints
+                        ]
                 adapters[record["id"]] = record
         except Exception:
             continue
@@ -213,19 +278,91 @@ def list_adapter_records() -> list[dict]:
         "videoId": None,
     }
     ordered = sorted(adapters.values(), key=lambda record: record.get("createdAt") or "", reverse=True)
-    return [base, *ordered]
+    result = [base]
+    for record in ordered:
+        result.extend(adapter_select_records(record))
+    return result
+
+
+def adapter_select_records(record: dict) -> list[dict]:
+    checkpoints = record.get("checkpoints") or []
+    visible = [dict(record)]
+    if checkpoints:
+        latest_step = record.get("checkpointStep") or checkpoints[-1].get("step")
+        visible[0]["name"] = f"{record['name']} (latest step {latest_step})"
+        for checkpoint in sorted(checkpoints, key=lambda item: item.get("step") or 0, reverse=True):
+            if str(checkpoint.get("weightPath")) == str(record.get("weightPath")):
+                continue
+            step = checkpoint.get("step")
+            weight_path = Path(checkpoint.get("weightPath", ""))
+            if not step or not weight_path.exists():
+                continue
+            option = dict(record)
+            option["id"] = f"{record['id']}@step-{step}"
+            option["name"] = f"{record['name']} (step {step})"
+            option["weightPath"] = str(weight_path)
+            option["checkpointStep"] = step
+            option["parentAdapterId"] = record["id"]
+            visible.append(option)
+    return visible
 
 
 def get_adapter_weight_path(adapter_id: str) -> Path | None:
     if adapter_id == "base":
         return None
+    checkpoint_step: int | None = None
+    root_id = root_adapter_id(adapter_id)
+    if "@step-" in adapter_id:
+        _, step_text = adapter_id.split("@step-", 1)
+        try:
+            checkpoint_step = int(step_text)
+        except ValueError as exc:
+            raise HTTPException(status_code=404, detail="Film adapter checkpoint not found") from exc
     record = adapters.get(adapter_id)
+    if not record and checkpoint_step is not None:
+        record = adapters.get(root_id)
     if not record:
         raise HTTPException(status_code=404, detail="Film adapter not found")
-    weight_path = Path(record["weightPath"])
+    if checkpoint_step is None:
+        weight_path = Path(record["weightPath"])
+    else:
+        checkpoint = next(
+            (
+                item
+                for item in record.get("checkpoints", [])
+                if item.get("step") == checkpoint_step
+            ),
+            None,
+        )
+        if not checkpoint:
+            raise HTTPException(status_code=404, detail="Film adapter checkpoint not found")
+        weight_path = Path(checkpoint["weightPath"])
     if not weight_path.exists():
         raise HTTPException(status_code=404, detail="Film adapter weights are missing")
     return weight_path
+
+
+def adapter_root_path(record: dict, adapter_id: str) -> Path:
+    root_path = resolve_repo_path(Path(record.get("rootPath") or ADAPTER_DIR / adapter_id))
+    ensure_adapter_path(root_path)
+    return root_path
+
+
+def active_job_ids() -> list[str]:
+    with jobs_lock:
+        return [job.id for job in jobs.values() if job.status in {"queued", "running"}]
+
+
+def adapter_training_params(request: AdapterTrainRequest) -> dict[str, int]:
+    params = dict(ADAPTER_QUALITY_PRESETS[request.quality])
+    if request.maxFrames is not None:
+        params["maxFrames"] = request.maxFrames
+    if request.patchesPerFrame is not None:
+        params["patchesPerFrame"] = request.patchesPerFrame
+    if request.maxTrainSteps is not None:
+        params["maxTrainSteps"] = request.maxTrainSteps
+    params["checkpointingSteps"] = max(25, math.ceil(params["maxTrainSteps"] / params["checkpointsTotalLimit"]))
+    return params
 
 
 def update_job(job_id: str, **changes) -> None:
@@ -486,7 +623,85 @@ def list_adapters() -> dict:
     return {"adapters": list_adapter_records()}
 
 
+@app.delete("/api/adapters")
+def delete_all_adapters() -> dict:
+    active_jobs = active_job_ids()
+    if active_jobs:
+        raise HTTPException(status_code=409, detail="Cannot delete film adapters while a job is running")
+
+    unloaded = engine.unload_if_weight_under(ADAPTER_DIR)
+    deleted: list[dict] = []
+    total_files = 0
+    total_dirs = 0
+    total_bytes = 0
+    for child in sorted(ADAPTER_DIR.iterdir()):
+        if not child.exists():
+            continue
+        ensure_adapter_path(child)
+        usage = remove_generated_path(child, recreate=False)
+        deleted.append(
+            {
+                "id": child.name,
+                "filesDeleted": usage["files"],
+                "directoriesDeleted": usage["dirs"],
+                "bytesFreed": usage["bytes"],
+            }
+        )
+        total_files += usage["files"]
+        total_dirs += usage["dirs"]
+        total_bytes += usage["bytes"]
+    adapters.clear()
+    return {
+        "deletedAdapters": deleted,
+        "adaptersDeleted": len(deleted),
+        "filesDeleted": total_files,
+        "directoriesDeleted": total_dirs,
+        "bytesFreed": total_bytes,
+        "unloadedModel": unloaded,
+        "basePreserved": True,
+    }
+
+
+@app.delete("/api/adapters/{adapter_id}")
+def delete_adapter(adapter_id: str) -> dict:
+    root_id = root_adapter_id(adapter_id)
+    if root_id == "base":
+        raise HTTPException(status_code=400, detail="Base HYPIR cannot be deleted")
+    active_jobs = active_job_ids()
+    if active_jobs:
+        raise HTTPException(status_code=409, detail="Cannot delete film adapters while a job is running")
+
+    if root_id not in adapters:
+        load_adapter_records()
+    record = adapters.get(root_id)
+    if not record:
+        raise HTTPException(status_code=404, detail="Film adapter not found")
+
+    root_path = adapter_root_path(record, root_id)
+    unloaded = engine.unload_if_weight_under(root_path)
+    try:
+        usage = remove_generated_path(root_path, recreate=False)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Film adapter delete failed: {exc}") from exc
+    adapters.pop(root_id, None)
+    return {
+        "deletedAdapterId": root_id,
+        "deletedName": record.get("name") or root_id,
+        "filesDeleted": usage["files"],
+        "directoriesDeleted": usage["dirs"],
+        "bytesFreed": usage["bytes"],
+        "unloadedModel": unloaded,
+    }
+
+
 def latest_checkpoint_weight(output_dir: Path) -> Path | None:
+    checkpoints = checkpoint_weights(output_dir)
+    if not checkpoints:
+        return None
+    return checkpoints[-1]["weightPath"]
+
+
+def checkpoint_weights(output_dir: Path) -> list[dict]:
     checkpoints = []
     for checkpoint in output_dir.glob("checkpoint-*"):
         if not checkpoint.is_dir():
@@ -497,10 +712,65 @@ def latest_checkpoint_weight(output_dir: Path) -> Path | None:
             continue
         weight_path = checkpoint / "state_dict.pth"
         if weight_path.exists():
-            checkpoints.append((step, weight_path))
+            checkpoints.append({"step": step, "weightPath": weight_path})
+    return sorted(checkpoints, key=lambda item: item["step"])
+
+
+def usable_checkpoint(checkpoints: list[dict], train_params: dict[str, int]) -> dict | None:
     if not checkpoints:
         return None
-    return sorted(checkpoints, key=lambda item: item[0])[-1][1]
+    min_step = min(train_params["maxTrainSteps"], train_params["checkpointingSteps"])
+    min_step = max(25, min_step)
+    usable = [checkpoint for checkpoint in checkpoints if checkpoint["step"] >= min_step]
+    return usable[-1] if usable else None
+
+
+def build_adapter_record(
+    *,
+    adapter_id: str,
+    source_record: dict,
+    request: AdapterTrainRequest,
+    adapter_root: Path,
+    prompt: str,
+    dataset: object,
+    train_params: dict[str, int],
+    checkpoints: list[dict],
+    recovered: bool,
+    return_code: int | None = None,
+) -> dict:
+    checkpoint = checkpoints[-1]
+    step = checkpoint["step"]
+    suffix = f" {request.quality.title()}"
+    if recovered:
+        suffix += f" Partial Step {step}"
+    adapter_name = f"{Path(source_record['name']).stem} Film Adapter{suffix}"
+    return {
+        "id": adapter_id,
+        "name": adapter_name,
+        "status": "partial" if recovered else "ready",
+        "videoId": request.videoId,
+        "videoName": source_record["name"],
+        "weightPath": str(checkpoint["weightPath"]),
+        "rootPath": str(adapter_root),
+        "prompt": prompt,
+        "quality": request.quality,
+        "candidateFrames": dataset.candidates,
+        "frames": dataset.frames,
+        "patches": dataset.patches,
+        "maxFrames": train_params["maxFrames"],
+        "patchesPerFrame": train_params["patchesPerFrame"],
+        "maxTrainSteps": train_params["maxTrainSteps"],
+        "checkpointingSteps": train_params["checkpointingSteps"],
+        "checkpointsTotalLimit": train_params["checkpointsTotalLimit"],
+        "checkpointStep": step,
+        "recoveredFromCrash": recovered,
+        "trainerReturnCode": return_code,
+        "checkpoints": [
+            {"step": item["step"], "weightPath": str(item["weightPath"])}
+            for item in checkpoints
+        ],
+        "createdAt": now_iso(),
+    }
 
 
 def run_adapter_training(job_id: str, request: AdapterTrainRequest) -> None:
@@ -513,11 +783,12 @@ def run_adapter_training(job_id: str, request: AdapterTrainRequest) -> None:
         source = Path(record["path"])
         metadata = record["metadata"]
         prompt = request.prompt.strip() or "film-specific restoration, natural detail, consistent texture"
+        train_params = adapter_training_params(request)
         update_job(
             job_id,
             status="running",
             progress=0.04,
-            message="Sampling film frames for adapter training",
+            message=f"Sampling film frames for {request.quality} adapter training",
             videoId=request.videoId,
         )
         dataset = build_adapter_dataset(
@@ -526,9 +797,11 @@ def run_adapter_training(job_id: str, request: AdapterTrainRequest) -> None:
             adapter_root=adapter_root,
             base_model_path=engine.base_model_path,
             prompt=prompt,
-            max_frames=request.maxFrames,
-            patches_per_frame=request.patchesPerFrame,
-            max_train_steps=request.maxTrainSteps,
+            max_frames=train_params["maxFrames"],
+            patches_per_frame=train_params["patchesPerFrame"],
+            max_train_steps=train_params["maxTrainSteps"],
+            checkpointing_steps=train_params["checkpointingSteps"],
+            checkpoints_total_limit=train_params["checkpointsTotalLimit"],
         )
         if job_id in cancelled_jobs:
             update_job(job_id, status="cancelled", progress=0.12, message="Film adapter training cancelled")
@@ -538,7 +811,10 @@ def run_adapter_training(job_id: str, request: AdapterTrainRequest) -> None:
         update_job(
             job_id,
             progress=0.16,
-            message=f"Training film adapter on {dataset.patches} patches from {dataset.frames} frames",
+            message=(
+                f"Training {request.quality} film adapter on "
+                f"{dataset.patches} patches from {dataset.frames} selected frames"
+            ),
             framesDone=dataset.patches,
             framesTotal=dataset.patches,
         )
@@ -594,36 +870,64 @@ def run_adapter_training(job_id: str, request: AdapterTrainRequest) -> None:
                     return
             return_code = process.wait()
         if return_code != 0:
-            raise RuntimeError(f"HYPIR adapter training failed with exit code {return_code}. See {log_path}")
+            checkpoints = checkpoint_weights(dataset.output_dir)
+            recovered_checkpoint = usable_checkpoint(checkpoints, train_params)
+            if not recovered_checkpoint:
+                raise RuntimeError(f"HYPIR adapter training failed with exit code {return_code}. See {log_path}")
+            checkpoints = [item for item in checkpoints if item["step"] <= recovered_checkpoint["step"]]
+            adapter_record = build_adapter_record(
+                adapter_id=adapter_id,
+                source_record=record,
+                request=request,
+                adapter_root=adapter_root,
+                prompt=prompt,
+                dataset=dataset,
+                train_params=train_params,
+                checkpoints=checkpoints,
+                recovered=True,
+                return_code=return_code,
+            )
+            adapters[adapter_id] = adapter_record
+            save_adapter_record(adapter_record)
+            update_job(
+                job_id,
+                status="done",
+                progress=1.0,
+                message=(
+                    f"Film adapter recovered from checkpoint {adapter_record['checkpointStep']} "
+                    f"after trainer exit code {return_code}"
+                ),
+                adapterId=adapter_id,
+                adapterName=adapter_record["name"],
+                outputPath=adapter_record["weightPath"],
+                etaSeconds=0,
+            )
+            return
 
-        weight_path = latest_checkpoint_weight(dataset.output_dir)
-        if not weight_path:
+        checkpoints = checkpoint_weights(dataset.output_dir)
+        if not checkpoints:
             raise RuntimeError(f"Training finished, but no checkpoint state_dict.pth was found under {dataset.output_dir}")
-        adapter_name = f"{Path(record['name']).stem} Film Adapter"
-        adapter_record = {
-            "id": adapter_id,
-            "name": adapter_name,
-            "status": "ready",
-            "videoId": request.videoId,
-            "videoName": record["name"],
-            "weightPath": str(weight_path),
-            "rootPath": str(adapter_root),
-            "prompt": prompt,
-            "frames": dataset.frames,
-            "patches": dataset.patches,
-            "maxTrainSteps": request.maxTrainSteps,
-            "createdAt": now_iso(),
-        }
+        adapter_record = build_adapter_record(
+            adapter_id=adapter_id,
+            source_record=record,
+            request=request,
+            adapter_root=adapter_root,
+            prompt=prompt,
+            dataset=dataset,
+            train_params=train_params,
+            checkpoints=checkpoints,
+            recovered=False,
+        )
         adapters[adapter_id] = adapter_record
         save_adapter_record(adapter_record)
         update_job(
             job_id,
             status="done",
             progress=1.0,
-            message=f"Film adapter ready: {adapter_name}",
+            message=f"Film adapter ready: {adapter_record['name']}",
             adapterId=adapter_id,
-            adapterName=adapter_name,
-            outputPath=str(weight_path),
+            adapterName=adapter_record["name"],
+            outputPath=adapter_record["weightPath"],
             etaSeconds=0,
         )
     except Exception as exc:
@@ -729,11 +1033,20 @@ def preview_frame(request: PreviewRequest) -> dict:
     preview_root = PREVIEW_DIR / preview_id
     original = preview_root / "original.png"
     enhanced = preview_root / "enhanced.png"
+    adapter_preview: Path | None = None
     try:
         extract_frame(Path(record["path"]), request.seconds, original)
-        result = engine.enhance_file(original, enhanced, request.to_hypir(adapter_weight_path))
+        if second_pass_enabled(request):
+            adapter_preview = preview_root / "adapter_pass.png"
+            engine.enhance_file(original, adapter_preview, request.to_hypir(adapter_weight_path))
+            result = engine.enhance_file(adapter_preview, enhanced, request.to_base_refine_hypir())
+        else:
+            result = engine.enhance_file(original, enhanced, request.to_hypir(adapter_weight_path))
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Preview failed: {exc}") from exc
+    finally:
+        if adapter_preview is not None:
+            adapter_preview.unlink(missing_ok=True)
 
     return {
         "id": preview_id,
@@ -741,7 +1054,12 @@ def preview_frame(request: PreviewRequest) -> dict:
         "originalUrl": f"/media/previews/{preview_id}/original.png",
         "enhancedUrl": f"/media/previews/{preview_id}/enhanced.png",
         "result": result,
+        "passes": 2 if second_pass_enabled(request) else 1,
     }
+
+
+def second_pass_enabled(request: ProcessSettings) -> bool:
+    return request.secondPass == "base_after_adapter" and request.adapterId != "base"
 
 
 def run_export(job_id: str, request: ExportRequest) -> None:
@@ -793,7 +1111,12 @@ def run_export(job_id: str, request: ExportRequest) -> None:
         frames = reusable_frames(source, raw_frames, expected_count)
         total = len(frames)
         adapter_weight_path = get_adapter_weight_path(request.adapterId)
-        settings = request.to_hypir(adapter_weight_path)
+        adapter_settings = request.to_hypir(adapter_weight_path)
+        base_refine_settings = request.to_base_refine_hypir()
+        use_second_pass = second_pass_enabled(request)
+        adapter_pass_frames = cache_root / "adapter_pass"
+        if use_second_pass:
+            adapter_pass_frames.mkdir(parents=True, exist_ok=True)
         outputs = [
             (frame, enhanced_frames / frame.name, valid_image(enhanced_frames / frame.name))
             for frame in frames
@@ -807,91 +1130,220 @@ def run_export(job_id: str, request: ExportRequest) -> None:
         previous_source_frame: Path | None = None
         previous_enhanced_frame: Path | None = None
 
-        for index, (frame, output, cached) in enumerate(outputs, start=1):
-            if job_id in cancelled_jobs:
-                write_cache_manifest(cache_root, record, request, "cancelled")
+        if use_second_pass:
+            stage_inputs = [
+                (index, frame, adapter_pass_frames / frame.name)
+                for index, (frame, _output, cached) in enumerate(outputs, start=1)
+                if not cached
+            ]
+            stage_missing = [
+                (index, frame, adapter_output)
+                for index, frame, adapter_output in stage_inputs
+                if not valid_image(adapter_output)
+            ]
+            for stage_index, (frame_index, frame, adapter_output) in enumerate(stage_missing, start=1):
+                if job_id in cancelled_jobs:
+                    write_cache_manifest(cache_root, record, request, "cancelled")
+                    update_job(
+                        job_id,
+                        status="cancelled",
+                        progress=0.05 + (stage_index - 1) / max(len(stage_missing), 1) * 0.40,
+                        message=f"Stopped during adapter pass. Cached {cache_misses_done} / {total} final frames.",
+                        framesDone=cache_misses_done,
+                        framesTotal=total,
+                        etaSeconds=None,
+                    )
+                    cancelled_jobs.discard(job_id)
+                    return
+
                 update_job(
                     job_id,
-                    status="cancelled",
-                    progress=0.05 + (index - 1) / max(total, 1) * 0.84,
-                    message=f"Stopped. Cached {index - 1} / {total} enhanced frames.",
+                    progress=0.05 + (stage_index - 1) / max(len(stage_missing), 1) * 0.40,
+                    message=f"Adapter pass frame {frame_index} / {total}",
+                    etaSeconds=None,
+                    framesDone=stage_index - 1,
+                    framesTotal=max(len(stage_missing), 1),
+                    currentFrameIndex=frame_index,
+                    currentFrameSeconds=(frame_index - 1) / fps,
+                    currentOriginalUrl=media_url(frame),
+                    currentEnhancedUrl=media_url(adapter_output) if valid_image(adapter_output) else None,
+                    cacheHits=cache_hits,
+                    cacheMisses=cache_misses_done,
+                )
+                frame_started = time.monotonic()
+                engine.enhance_file(frame, adapter_output, adapter_settings)
+                generation_elapsed += time.monotonic() - frame_started
+
+            for index, (frame, output, cached) in enumerate(outputs, start=1):
+                if job_id in cancelled_jobs:
+                    write_cache_manifest(cache_root, record, request, "cancelled")
+                    update_job(
+                        job_id,
+                        status="cancelled",
+                        progress=0.45 + (index - 1) / max(total, 1) * 0.44,
+                        message=f"Stopped. Cached {index - 1} / {total} enhanced frames.",
+                        framesDone=index - 1,
+                        framesTotal=total,
+                        etaSeconds=None,
+                    )
+                    cancelled_jobs.discard(job_id)
+                    return
+
+                adapter_output = adapter_pass_frames / frame.name
+                remaining_misses = max(0, missing_total - cache_misses_done)
+                update_job(
+                    job_id,
+                    progress=0.45 + (index - 1) / max(total, 1) * 0.44,
+                    message=(
+                        f"Using cached frame {index} / {total}"
+                        if cached else f"Base pass frame {index} / {total}"
+                    ),
+                    etaSeconds=eta_seconds(generation_elapsed, cache_misses_done, remaining_misses),
                     framesDone=index - 1,
                     framesTotal=total,
-                    etaSeconds=None,
+                    currentFrameIndex=index,
+                    currentFrameSeconds=(index - 1) / fps,
+                    currentOriginalUrl=media_url(frame),
+                    currentEnhancedUrl=media_url(output) if cached else None,
+                    cacheHits=cache_hits,
+                    cacheMisses=cache_misses_done,
                 )
-                cancelled_jobs.discard(job_id)
-                return
+                if not cached:
+                    if not valid_image(adapter_output):
+                        engine.enhance_file(frame, adapter_output, adapter_settings)
+                    frame_started = time.monotonic()
+                    if temporal_enabled and previous_source_frame and previous_enhanced_frame:
+                        raw_output = output.with_name(f"{output.stem}.base_tmp{output.suffix}")
+                        try:
+                            engine.enhance_file(adapter_output, raw_output, base_refine_settings)
+                            stabilize_frame(
+                                previous_source_path=previous_source_frame,
+                                current_source_path=frame,
+                                previous_enhanced_path=previous_enhanced_frame,
+                                current_enhanced_path=raw_output,
+                                output_path=output,
+                                mode=request.temporalConsistency,
+                            )
+                        finally:
+                            raw_output.unlink(missing_ok=True)
+                    else:
+                        engine.enhance_file(adapter_output, output, base_refine_settings)
+                    generation_elapsed += time.monotonic() - frame_started
+                    cache_misses_done += 1
+                    frame_event = add_frame_event(
+                        job_id,
+                        frame_index=index,
+                        frames_total=total,
+                        seconds=(index - 1) / fps,
+                        original_path=frame,
+                        enhanced_path=output,
+                        cached=False,
+                    )
+                    latest_frame_seq = frame_event.seq
 
-            remaining_misses = max(0, missing_total - cache_misses_done)
-            update_job(
-                job_id,
-                progress=0.05 + (index - 1) / max(total, 1) * 0.84,
-                message=(
-                    f"Using cached frame {index} / {total}"
-                    if cached else f"Enhancing frame {index} / {total}"
-                ),
-                etaSeconds=eta_seconds(generation_elapsed, cache_misses_done, remaining_misses),
-                framesDone=index - 1,
-                framesTotal=total,
-                currentFrameIndex=index,
-                currentFrameSeconds=(index - 1) / fps,
-                currentOriginalUrl=media_url(frame),
-                currentEnhancedUrl=media_url(output) if cached else None,
-                cacheHits=cache_hits,
-                cacheMisses=cache_misses_done,
-            )
-            if cached:
-                frame_event = None
-            else:
-                frame_started = time.monotonic()
-                if temporal_enabled and previous_source_frame and previous_enhanced_frame:
-                    raw_output = output.with_name(f"{output.stem}.hypir_tmp{output.suffix}")
-                    try:
-                        engine.enhance_file(frame, raw_output, settings)
-                        stabilize_frame(
-                            previous_source_path=previous_source_frame,
-                            current_source_path=frame,
-                            previous_enhanced_path=previous_enhanced_frame,
-                            current_enhanced_path=raw_output,
-                            output_path=output,
-                            mode=request.temporalConsistency,
-                        )
-                    finally:
-                        raw_output.unlink(missing_ok=True)
-                else:
-                    engine.enhance_file(frame, output, settings)
-                generation_elapsed += time.monotonic() - frame_started
-                cache_misses_done += 1
-                frame_event = add_frame_event(
+                frame_seconds = (index - 1) / fps
+                remaining_misses = max(0, missing_total - cache_misses_done)
+                update_job(
                     job_id,
-                    frame_index=index,
-                    frames_total=total,
-                    seconds=(index - 1) / fps,
-                    original_path=frame,
-                    enhanced_path=output,
-                    cached=False,
+                    progress=0.45 + index / max(total, 1) * 0.44,
+                    message=f"Frame {index} / {total} ready",
+                    etaSeconds=eta_seconds(generation_elapsed, cache_misses_done, remaining_misses),
+                    framesDone=index,
+                    framesTotal=total,
+                    currentFrameIndex=index,
+                    currentFrameSeconds=frame_seconds,
+                    currentOriginalUrl=media_url(frame),
+                    currentEnhancedUrl=media_url(output),
+                    latestFrameSeq=latest_frame_seq,
+                    cacheHits=cache_hits,
+                    cacheMisses=cache_misses_done,
                 )
-                latest_frame_seq = frame_event.seq
+                previous_source_frame = frame
+                previous_enhanced_frame = output
+        else:
+            for index, (frame, output, cached) in enumerate(outputs, start=1):
+                if job_id in cancelled_jobs:
+                    write_cache_manifest(cache_root, record, request, "cancelled")
+                    update_job(
+                        job_id,
+                        status="cancelled",
+                        progress=0.05 + (index - 1) / max(total, 1) * 0.84,
+                        message=f"Stopped. Cached {index - 1} / {total} enhanced frames.",
+                        framesDone=index - 1,
+                        framesTotal=total,
+                        etaSeconds=None,
+                    )
+                    cancelled_jobs.discard(job_id)
+                    return
 
-            frame_seconds = (index - 1) / fps
-            remaining_misses = max(0, missing_total - cache_misses_done)
-            update_job(
-                job_id,
-                progress=0.05 + index / max(total, 1) * 0.84,
-                message=f"Frame {index} / {total} ready",
-                etaSeconds=eta_seconds(generation_elapsed, cache_misses_done, remaining_misses),
-                framesDone=index,
-                framesTotal=total,
-                currentFrameIndex=index,
-                currentFrameSeconds=frame_seconds,
-                currentOriginalUrl=media_url(frame),
-                currentEnhancedUrl=media_url(output),
-                latestFrameSeq=latest_frame_seq,
-                cacheHits=cache_hits,
-                cacheMisses=cache_misses_done,
-            )
-            previous_source_frame = frame
-            previous_enhanced_frame = output
+                remaining_misses = max(0, missing_total - cache_misses_done)
+                update_job(
+                    job_id,
+                    progress=0.05 + (index - 1) / max(total, 1) * 0.84,
+                    message=(
+                        f"Using cached frame {index} / {total}"
+                        if cached else f"Enhancing frame {index} / {total}"
+                    ),
+                    etaSeconds=eta_seconds(generation_elapsed, cache_misses_done, remaining_misses),
+                    framesDone=index - 1,
+                    framesTotal=total,
+                    currentFrameIndex=index,
+                    currentFrameSeconds=(index - 1) / fps,
+                    currentOriginalUrl=media_url(frame),
+                    currentEnhancedUrl=media_url(output) if cached else None,
+                    cacheHits=cache_hits,
+                    cacheMisses=cache_misses_done,
+                )
+                if not cached:
+                    frame_started = time.monotonic()
+                    if temporal_enabled and previous_source_frame and previous_enhanced_frame:
+                        raw_output = output.with_name(f"{output.stem}.hypir_tmp{output.suffix}")
+                        try:
+                            engine.enhance_file(frame, raw_output, adapter_settings)
+                            stabilize_frame(
+                                previous_source_path=previous_source_frame,
+                                current_source_path=frame,
+                                previous_enhanced_path=previous_enhanced_frame,
+                                current_enhanced_path=raw_output,
+                                output_path=output,
+                                mode=request.temporalConsistency,
+                            )
+                        finally:
+                            raw_output.unlink(missing_ok=True)
+                    else:
+                        engine.enhance_file(frame, output, adapter_settings)
+                    generation_elapsed += time.monotonic() - frame_started
+                    cache_misses_done += 1
+                    frame_event = add_frame_event(
+                        job_id,
+                        frame_index=index,
+                        frames_total=total,
+                        seconds=(index - 1) / fps,
+                        original_path=frame,
+                        enhanced_path=output,
+                        cached=False,
+                    )
+                    latest_frame_seq = frame_event.seq
+
+                frame_seconds = (index - 1) / fps
+                remaining_misses = max(0, missing_total - cache_misses_done)
+                update_job(
+                    job_id,
+                    progress=0.05 + index / max(total, 1) * 0.84,
+                    message=f"Frame {index} / {total} ready",
+                    etaSeconds=eta_seconds(generation_elapsed, cache_misses_done, remaining_misses),
+                    framesDone=index,
+                    framesTotal=total,
+                    currentFrameIndex=index,
+                    currentFrameSeconds=frame_seconds,
+                    currentOriginalUrl=media_url(frame),
+                    currentEnhancedUrl=media_url(output),
+                    latestFrameSeq=latest_frame_seq,
+                    cacheHits=cache_hits,
+                    cacheMisses=cache_misses_done,
+                )
+                previous_source_frame = frame
+                previous_enhanced_frame = output
 
         write_cache_manifest(cache_root, record, request, "complete")
         update_job(job_id, progress=0.92, message="Encoding H.264 video", etaSeconds=None)

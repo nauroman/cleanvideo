@@ -119,6 +119,21 @@ class HypirEngine:
         self._device = device
         self._loaded_weight_path = resolved_weight_path
 
+    def unload_if_weight_under(self, root_path: Path) -> bool:
+        with self._lock:
+            if self._loaded_weight_path is None:
+                return False
+            loaded_path = self._loaded_weight_path.resolve()
+            resolved_root = root_path.resolve()
+            if loaded_path != resolved_root and resolved_root not in loaded_path.parents:
+                return False
+            self._model = None
+            self._device = None
+            self._loaded_weight_path = None
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            return True
+
     def enhance_file(self, input_path: Path, output_path: Path, settings: HypirSettings) -> dict:
         output_path.parent.mkdir(parents=True, exist_ok=True)
         seed = settings.seed if settings.seed != -1 else random.randint(0, 2**32 - 1)
