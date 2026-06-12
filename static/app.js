@@ -7,6 +7,7 @@ const state = {
   previewDirty: false,
   previewVersion: 0,
   exportInFlight: false,
+  partialExportInFlight: false,
   adapterInFlight: false,
   currentAdapterJobId: null,
   adapterTimer: null,
@@ -19,6 +20,8 @@ const state = {
   frameEventsInFlight: false,
   framePlaybackTimer: null,
   lastDisplayedFrameSeq: 0,
+  lastExportFramesDone: 0,
+  lastExportFramesTotal: 0,
 };
 
 const settingsStorageKey = "cleanvideo.session.v1";
@@ -46,6 +49,7 @@ const els = {
   durationTime: document.querySelector("#durationTime"),
   exportButton: document.querySelector("#exportButton"),
   cancelExportButton: document.querySelector("#cancelExportButton"),
+  partialExportButton: document.querySelector("#partialExportButton"),
   openOutputFolderButton: document.querySelector("#openOutputFolderButton"),
   clearGeneratedButton: document.querySelector("#clearGeneratedButton"),
   activityText: document.querySelector("#activityText"),
@@ -53,6 +57,7 @@ const els = {
   etaText: document.querySelector("#etaText"),
   jobProgress: document.querySelector("#jobProgress"),
   downloadLink: document.querySelector("#downloadLink"),
+  partialDownloadLink: document.querySelector("#partialDownloadLink"),
   refreshStatusButton: document.querySelector("#refreshStatusButton"),
   gpuStatus: document.querySelector("#gpuStatus"),
   nvencStatus: document.querySelector("#nvencStatus"),
@@ -365,10 +370,15 @@ function updateScaleMode() {
 function resetGeneratedUi() {
   clearFramePlayback();
   state.currentJobId = null;
+  state.partialExportInFlight = false;
+  state.lastExportFramesDone = 0;
+  state.lastExportFramesTotal = 0;
   state.liveOriginalUrl = null;
   state.liveEnhancedUrl = null;
   els.downloadLink.hidden = true;
   els.downloadLink.removeAttribute("href");
+  els.partialDownloadLink.hidden = true;
+  els.partialDownloadLink.removeAttribute("href");
   els.originalPreview.hidden = true;
   els.originalPreview.removeAttribute("src");
   els.enhancedPreview.hidden = true;
@@ -386,6 +396,7 @@ function resetGeneratedUi() {
   els.frameProgressText.textContent = "Frames: --";
   els.etaText.textContent = "ETA: --";
   els.jobProgress.style.width = "0%";
+  updatePartialExportButton();
 }
 
 function setVideo(record, { persist = true } = {}) {
@@ -409,6 +420,12 @@ function setVideo(record, { persist = true } = {}) {
   els.etaText.textContent = "ETA: --";
   setExportEnabled(true);
   els.downloadLink.hidden = true;
+  els.partialDownloadLink.hidden = true;
+  els.partialDownloadLink.removeAttribute("href");
+  state.partialExportInFlight = false;
+  state.lastExportFramesDone = 0;
+  state.lastExportFramesTotal = 0;
+  updatePartialExportButton();
   if (persist) saveLocalState();
   setActivity("Preparing preview", 0.1);
   scheduleAutoPreview({ delay: 200, reason: "new video" });
@@ -555,8 +572,35 @@ function setExportEnabled(enabled) {
   els.trainAdapterButton.disabled = !enabled || !state.video || state.exportInFlight || state.previewInFlight || state.adapterInFlight;
   els.cancelAdapterButton.hidden = !state.adapterInFlight;
   els.cancelAdapterButton.disabled = !state.adapterInFlight;
-  els.clearGeneratedButton.disabled = state.exportInFlight || state.previewInFlight || state.adapterInFlight;
+  els.clearGeneratedButton.disabled = (
+    state.exportInFlight
+    || state.previewInFlight
+    || state.adapterInFlight
+    || state.partialExportInFlight
+  );
+  updatePartialExportButton();
   updateDeleteAdapterButton();
+}
+
+function updatePartialExportButton() {
+  const readyFrames = state.lastExportFramesDone;
+  const totalFrames = state.lastExportFramesTotal;
+  const canSave = Boolean(
+    state.exportInFlight
+    && state.currentJobId
+    && readyFrames > 0
+    && !state.partialExportInFlight
+  );
+  els.partialExportButton.hidden = !state.exportInFlight;
+  els.partialExportButton.disabled = !canSave;
+  if (state.partialExportInFlight) {
+    els.partialExportButton.title = "Saving partial video";
+  } else if (readyFrames > 0) {
+    const totalText = totalFrames ? ` / ${totalFrames}` : "";
+    els.partialExportButton.title = `Save ${readyFrames}${totalText} ready enhanced frames`;
+  } else {
+    els.partialExportButton.title = "No enhanced frames are ready yet";
+  }
 }
 
 function scheduleAutoPreview({ delay = 450, reason = "settings changed" } = {}) {
@@ -615,10 +659,15 @@ async function startExport() {
   window.clearTimeout(state.previewTimer);
   clearFramePlayback();
   state.exportInFlight = true;
+  state.partialExportInFlight = false;
+  state.lastExportFramesDone = 0;
+  state.lastExportFramesTotal = 0;
   state.previewDirty = false;
   setExportEnabled(false);
   saveLocalState();
   els.downloadLink.hidden = true;
+  els.partialDownloadLink.hidden = true;
+  els.partialDownloadLink.removeAttribute("href");
   els.frameProgressText.textContent = "Frames: preparing";
   els.etaText.textContent = "ETA: estimating";
   setActivity("Starting export", 0.02);
@@ -636,6 +685,7 @@ async function startExport() {
     });
     state.currentJobId = job.id;
     state.frameEventsAfter = 0;
+    updatePartialExportButton();
     saveLocalState();
     pollJob(job.id);
   } catch (error) {
@@ -763,6 +813,33 @@ async function cancelExport() {
   }
 }
 
+async function savePartialExport() {
+  if (!state.currentJobId || state.partialExportInFlight) return;
+  state.partialExportInFlight = true;
+  updatePartialExportButton();
+  setActivity("Saving partial video", null);
+  try {
+    const result = await api(`/api/jobs/${state.currentJobId}/partial-export`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        crf: Number(els.crf.value),
+        encoder: els.encoder.value,
+      }),
+    });
+    const totalText = result.framesTotal ? ` / ${result.framesTotal}` : "";
+    els.partialDownloadLink.href = result.outputUrl;
+    els.partialDownloadLink.textContent = `Download partial (${result.framesDone}${totalText} frames, ${formatTime(result.durationSeconds)})`;
+    els.partialDownloadLink.hidden = false;
+    setActivity(`Partial saved: ${result.framesDone}${totalText} frames with ${result.encoder}`, null);
+  } catch (error) {
+    setActivity(`Partial save failed: ${error.message}`, null);
+  } finally {
+    state.partialExportInFlight = false;
+    setExportEnabled(!state.exportInFlight && !state.previewInFlight && !state.adapterInFlight);
+  }
+}
+
 async function openOutputFolder() {
   els.openOutputFolderButton.disabled = true;
   try {
@@ -776,7 +853,7 @@ async function openOutputFolder() {
 }
 
 async function clearGeneratedFiles() {
-  if (state.exportInFlight || state.previewInFlight) return;
+  if (state.exportInFlight || state.previewInFlight || state.partialExportInFlight) return;
   const confirmed = window.confirm(
     "Delete all generated videos, preview images, cache files, and job records? Source uploads will stay."
   );
@@ -920,6 +997,9 @@ function updateLiveFrame(job) {
 
 function updateJobUi(job) {
   setActivity(job.message, job.progress);
+  state.lastExportFramesDone = Number(job.partialFramesReady ?? job.framesDone) || 0;
+  state.lastExportFramesTotal = Number(job.framesTotal) || 0;
+  updatePartialExportButton();
   if (job.framesTotal) {
     const cached = job.cacheHits ? ` | cached ${job.cacheHits}` : "";
     els.frameProgressText.textContent = `Frames: ${job.framesDone} / ${job.framesTotal}${cached}`;
@@ -1065,6 +1145,7 @@ els.sourceVideo.addEventListener("seeked", () => {
 
 els.exportButton.addEventListener("click", startExport);
 els.cancelExportButton.addEventListener("click", cancelExport);
+els.partialExportButton.addEventListener("click", savePartialExport);
 els.trainAdapterButton.addEventListener("click", startAdapterTraining);
 els.cancelAdapterButton.addEventListener("click", cancelAdapterTraining);
 els.deleteAdapterButton.addEventListener("click", deleteSelectedAdapter);

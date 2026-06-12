@@ -490,6 +490,12 @@ svg {
   transition: width 180ms ease;
 }
 
+.export-links {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 14px;
+}
+
 .download-link {
   display: inline-flex;
   margin-top: 10px;

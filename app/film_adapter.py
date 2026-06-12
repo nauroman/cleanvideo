@@ -40,6 +40,9 @@ class AdapterDataset:
     candidates: int
     frames: int
     patches: int
+    max_train_steps: int
+    checkpointing_steps: int
+    checkpoints_total_limit: int
     parquet_path: Path
     config_path: Path
     output_dir: Path
@@ -54,8 +57,9 @@ def build_adapter_dataset(
     prompt: str,
     max_frames: int,
     patches_per_frame: int,
+    min_train_steps: int,
     max_train_steps: int,
-    checkpointing_steps: int,
+    train_steps_per_patch: float,
     checkpoints_total_limit: int,
 ) -> AdapterDataset:
     validate_training_dependencies()
@@ -67,7 +71,7 @@ def build_adapter_dataset(
             shutil.rmtree(directory)
         directory.mkdir(parents=True, exist_ok=True)
 
-    candidate_count = min(max(max_frames * 3, max_frames), max_frames + 256)
+    candidate_count = min(max(max_frames * 2, max_frames + 128), max_frames + 2048)
     candidates = extract_sample_frames(video_path, source_frames_dir, duration_seconds, candidate_count)
     extracted = select_training_frames(candidates, max_frames)
     patch_paths = write_training_patches(
@@ -78,6 +82,13 @@ def build_adapter_dataset(
     if not patch_paths:
         raise RuntimeError("Could not create any 512x512 training patches from this video.")
 
+    max_train_steps = training_step_count(
+        patch_count=len(patch_paths),
+        min_train_steps=min_train_steps,
+        max_train_steps=max_train_steps,
+        train_steps_per_patch=train_steps_per_patch,
+    )
+    checkpointing_steps = checkpoint_interval(max_train_steps, checkpoints_total_limit)
     parquet_path = adapter_root / "dataset.parquet"
     write_parquet(patch_paths, prompt, parquet_path)
     config_path = adapter_root / "hypir_train.yaml"
@@ -109,10 +120,31 @@ def build_adapter_dataset(
         candidates=len(candidates),
         frames=len(extracted),
         patches=len(patch_paths),
+        max_train_steps=max_train_steps,
+        checkpointing_steps=checkpointing_steps,
+        checkpoints_total_limit=checkpoints_total_limit,
         parquet_path=parquet_path,
         config_path=config_path,
         output_dir=output_dir,
     )
+
+
+def training_step_count(
+    *,
+    patch_count: int,
+    min_train_steps: int,
+    max_train_steps: int,
+    train_steps_per_patch: float,
+) -> int:
+    min_train_steps = max(20, min_train_steps)
+    max_train_steps = max(min_train_steps, max_train_steps)
+    adaptive_steps = math.ceil(max(1, patch_count) * max(0.0, train_steps_per_patch))
+    return min(max_train_steps, max(min_train_steps, adaptive_steps))
+
+
+def checkpoint_interval(max_train_steps: int, checkpoints_total_limit: int) -> int:
+    checkpoints_total_limit = max(1, checkpoints_total_limit)
+    return max(25, math.ceil(max_train_steps / checkpoints_total_limit))
 
 
 def validate_training_dependencies() -> None:
@@ -142,7 +174,7 @@ def extract_sample_frames(
     fps = 1.0
     if duration_seconds > 0:
         fps = max_frames / duration_seconds
-    fps = min(2.0, max(0.02, fps))
+    fps = min(2.0, max(0.001, fps))
     args = [
         "ffmpeg",
         "-y",
@@ -467,3 +499,66 @@ log_grad_modules: [conv_out]
 """,
         encoding="utf-8",
     )
+
+
+def set_train_config_resume_checkpoint(config_path: Path, checkpoint_dir: Path | None) -> None:
+    resume_value = "~" if checkpoint_dir is None else checkpoint_dir.as_posix()
+    replacement = f"resume_from_checkpoint: {resume_value}"
+    lines = config_path.read_text(encoding="utf-8").splitlines()
+    for index, line in enumerate(lines):
+        if line.startswith("resume_from_checkpoint:"):
+            lines[index] = replacement
+            break
+    else:
+        lines.append(replacement)
+    config_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def cleanup_adapter_training_artifacts(adapter_root: Path, keep_checkpoint_dir: Path) -> None:
+    adapter_root = adapter_root.resolve()
+    keep_checkpoint_dir = keep_checkpoint_dir.resolve()
+    ensure_child_path(adapter_root, keep_checkpoint_dir)
+
+    for directory_name in ["source_frames", "patches"]:
+        remove_path(adapter_root / directory_name)
+    for file_name in ["dataset.parquet", "dataset.json", "hypir_train.yaml", "train.log"]:
+        remove_path(adapter_root / file_name)
+
+    training_dir = adapter_root / "training"
+    if not training_dir.exists():
+        return
+
+    remove_path(training_dir / "logs")
+    for checkpoint_dir in training_dir.glob("checkpoint-*"):
+        if not checkpoint_dir.is_dir():
+            continue
+        if checkpoint_dir.resolve() == keep_checkpoint_dir:
+            compact_adapter_checkpoint(checkpoint_dir)
+        else:
+            remove_path(checkpoint_dir)
+
+
+def compact_adapter_checkpoint(checkpoint_dir: Path) -> None:
+    state_dict_path = checkpoint_dir / "state_dict.pth"
+    if not state_dict_path.exists():
+        raise RuntimeError(f"Cannot compact adapter checkpoint without {state_dict_path}")
+    for child in checkpoint_dir.iterdir():
+        if child.name == "state_dict.pth":
+            continue
+        remove_path(child)
+
+
+def ensure_child_path(root: Path, path: Path) -> None:
+    root = root.resolve()
+    path = path.resolve()
+    if path != root and root not in path.parents:
+        raise ValueError(f"Refusing to clean outside adapter root: {path}")
+
+
+def remove_path(path: Path) -> None:
+    if not path.exists():
+        return
+    if path.is_dir():
+        shutil.rmtree(path)
+    else:
+        path.unlink()

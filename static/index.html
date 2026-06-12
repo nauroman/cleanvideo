@@ -4,7 +4,7 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>CleanVideo</title>
-    <link rel="stylesheet" href="/styles.css?v=2026-06-12-film-adapter-v6" />
+    <link rel="stylesheet" href="/styles.css?v=2026-06-12-partial-export-v4" />
   </head>
   <body>
     <main class="app-shell">
@@ -97,7 +97,7 @@
                 class="help-button"
                 type="button"
                 aria-label="Adapter Quality help"
-                data-tooltip="Controls how much of the selected film is sampled before Create Film Adapter. Fast is a short test, High samples more scenes and trains longer, Extra is slowest. Temporary checkpoints are used during training; only the latest usable checkpoint is kept."
+                data-tooltip="Controls adaptive film sampling before Create Film Adapter. Longer videos automatically use more selected frames: Fast is a short test, High covers more scenes, Extra covers the widest range. Temporary checkpoints are used during training; only the latest usable checkpoint is kept."
               >?</button>
             </span>
             <select id="adapterQuality" aria-label="Adapter Quality">
@@ -182,6 +182,17 @@
               <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 6l12 12M18 6 6 18"/></svg>
               Stop Export
             </button>
+            <button
+              id="partialExportButton"
+              class="secondary-button"
+              type="button"
+              title="Save the enhanced frames that are ready now"
+              disabled
+              hidden
+            >
+              <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3v12M7 10l5 5 5-5M5 21h14"/></svg>
+              Save Partial
+            </button>
             <button id="openOutputFolderButton" class="secondary-button" type="button">
               <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 7h7l2 2h9v9a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/></svg>
               Open Output Folder
@@ -199,7 +210,10 @@
           <div class="progress-wrap">
             <div id="jobProgress" class="progress-bar"></div>
           </div>
-          <a id="downloadLink" class="download-link" href="#" download hidden>Download result</a>
+          <div class="export-links">
+            <a id="downloadLink" class="download-link" href="#" download hidden>Download result</a>
+            <a id="partialDownloadLink" class="download-link" href="#" download hidden>Download partial</a>
+          </div>
         </section>
       </section>
 
@@ -370,6 +384,6 @@
         </section>
       </aside>
     </main>
-    <script src="/app.js?v=2026-06-12-film-adapter-v6" type="module"></script>
+    <script src="/app.js?v=2026-06-12-partial-export-v4" type="module"></script>
   </body>
 </html>

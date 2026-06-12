@@ -22,7 +22,11 @@ from fastapi.staticfiles import StaticFiles
 from PIL import Image
 from pydantic import BaseModel, Field
 
-from .film_adapter import build_adapter_dataset
+from .film_adapter import (
+    build_adapter_dataset,
+    cleanup_adapter_training_artifacts,
+    set_train_config_resume_checkpoint,
+)
 from .hypir_engine import HypirSettings, engine
 from .temporal_stabilizer import TemporalConsistency, stabilize_frame, temporal_mode_enabled
 from .video_ops import (
@@ -44,31 +48,45 @@ PREVIEW_DIR = WORK_DIR / "previews"
 EXPORT_DIR = WORK_DIR / "exports"
 JOB_DIR = WORK_DIR / "jobs"
 CACHE_DIR = WORK_DIR / "cache"
+PARTIAL_DIR = WORK_DIR / "partials"
 ADAPTER_DIR = WORK_DIR / "adapters"
-for directory in [UPLOAD_DIR, PREVIEW_DIR, EXPORT_DIR, JOB_DIR, CACHE_DIR, ADAPTER_DIR]:
+for directory in [UPLOAD_DIR, PREVIEW_DIR, EXPORT_DIR, JOB_DIR, CACHE_DIR, PARTIAL_DIR, ADAPTER_DIR]:
     directory.mkdir(parents=True, exist_ok=True)
-GENERATED_DIRS = [PREVIEW_DIR, CACHE_DIR, JOB_DIR, EXPORT_DIR]
-APP_BUILD = "2026-06-12-film-adapter-v6"
+GENERATED_DIRS = [PREVIEW_DIR, CACHE_DIR, PARTIAL_DIR, JOB_DIR, EXPORT_DIR]
+APP_BUILD = "2026-06-12-adapter-recovery-v1"
+ADAPTER_TRAINING_RECOVERY_LIMIT = 3
 
 AdapterQuality = Literal["fast", "high", "extra"]
 SecondPassMode = Literal["off", "base_after_adapter"]
-ADAPTER_QUALITY_PRESETS: dict[str, dict[str, int]] = {
+ADAPTER_QUALITY_PRESETS: dict[str, dict[str, float]] = {
     "fast": {
-        "maxFrames": 32,
-        "patchesPerFrame": 3,
-        "maxTrainSteps": 300,
+        "minFrames": 64,
+        "maxFrames": 160,
+        "secondsPerFrame": 45,
+        "patchesPerFrame": 1,
+        "minTrainSteps": 240,
+        "maxTrainSteps": 600,
+        "trainStepsPerPatch": 1.2,
         "checkpointsTotalLimit": 2,
     },
     "high": {
-        "maxFrames": 80,
-        "patchesPerFrame": 5,
-        "maxTrainSteps": 900,
+        "minFrames": 192,
+        "maxFrames": 768,
+        "secondsPerFrame": 10,
+        "patchesPerFrame": 2,
+        "minTrainSteps": 900,
+        "maxTrainSteps": 3000,
+        "trainStepsPerPatch": 1.3,
         "checkpointsTotalLimit": 4,
     },
     "extra": {
-        "maxFrames": 128,
-        "patchesPerFrame": 7,
-        "maxTrainSteps": 1200,
+        "minFrames": 480,
+        "maxFrames": 1600,
+        "secondsPerFrame": 4.5,
+        "patchesPerFrame": 2,
+        "minTrainSteps": 1500,
+        "maxTrainSteps": 6000,
+        "trainStepsPerPatch": 1.75,
         "checkpointsTotalLimit": 5,
     },
 }
@@ -126,13 +144,18 @@ class ExportRequest(ProcessSettings):
     encoder: Literal["auto", "h264_nvenc", "libx264"] = "auto"
 
 
+class PartialExportRequest(BaseModel):
+    crf: int = Field(default=18, ge=12, le=32)
+    encoder: Literal["auto", "h264_nvenc", "libx264"] = "auto"
+
+
 class AdapterTrainRequest(BaseModel):
     videoId: str
     prompt: str = "film-specific restoration, natural detail, consistent texture"
     quality: AdapterQuality = "fast"
-    maxFrames: int | None = Field(default=None, ge=4, le=240)
+    maxFrames: int | None = Field(default=None, ge=4, le=2000)
     patchesPerFrame: int | None = Field(default=None, ge=1, le=9)
-    maxTrainSteps: int | None = Field(default=None, ge=20, le=3000)
+    maxTrainSteps: int | None = Field(default=None, ge=20, le=10000)
 
 
 class JobState(BaseModel):
@@ -145,6 +168,7 @@ class JobState(BaseModel):
     etaSeconds: float | None = None
     framesDone: int = 0
     framesTotal: int = 0
+    partialFramesReady: int = 0
     currentFrameIndex: int | None = None
     currentFrameSeconds: float | None = None
     currentOriginalUrl: str | None = None
@@ -188,6 +212,7 @@ jobs: dict[str, JobState] = {}
 job_frame_events: dict[str, list[FrameEvent]] = {}
 jobs_lock = threading.Lock()
 cancelled_jobs: set[str] = set()
+partial_exports_active: set[str] = set()
 job_processes: dict[str, subprocess.Popen] = {}
 
 
@@ -342,15 +367,33 @@ def active_job_ids() -> list[str]:
         return [job.id for job in jobs.values() if job.status in {"queued", "running"}]
 
 
-def adapter_training_params(request: AdapterTrainRequest) -> dict[str, int]:
-    params = dict(ADAPTER_QUALITY_PRESETS[request.quality])
+def duration_adaptive_frame_count(duration_seconds: float, preset: dict[str, float]) -> int:
+    min_frames = int(preset["minFrames"])
+    max_frames = int(preset["maxFrames"])
+    seconds_per_frame = float(preset["secondsPerFrame"])
+    if duration_seconds <= 0 or seconds_per_frame <= 0:
+        return min_frames
+    duration_target = math.ceil(duration_seconds / seconds_per_frame)
+    return min(max_frames, max(min_frames, duration_target))
+
+
+def adapter_training_params(request: AdapterTrainRequest, duration_seconds: float) -> dict:
+    preset = ADAPTER_QUALITY_PRESETS[request.quality]
+    params = {
+        "maxFrames": duration_adaptive_frame_count(duration_seconds, preset),
+        "patchesPerFrame": int(preset["patchesPerFrame"]),
+        "minTrainSteps": int(preset["minTrainSteps"]),
+        "maxTrainSteps": int(preset["maxTrainSteps"]),
+        "trainStepsPerPatch": float(preset["trainStepsPerPatch"]),
+        "checkpointsTotalLimit": int(preset["checkpointsTotalLimit"]),
+    }
     if request.maxFrames is not None:
         params["maxFrames"] = request.maxFrames
     if request.patchesPerFrame is not None:
         params["patchesPerFrame"] = request.patchesPerFrame
     if request.maxTrainSteps is not None:
+        params["minTrainSteps"] = request.maxTrainSteps
         params["maxTrainSteps"] = request.maxTrainSteps
-    params["checkpointingSteps"] = max(25, math.ceil(params["maxTrainSteps"] / params["checkpointsTotalLimit"]))
     return params
 
 
@@ -446,6 +489,17 @@ def export_output_path(record: dict, cache_key: str, request: ExportRequest) -> 
     return EXPORT_DIR / safe_name(output_name)
 
 
+def partial_output_path(record: dict, cache_key: str, frame_count: int, request: PartialExportRequest) -> Path:
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    suffix = uuid.uuid4().hex[:6]
+    stem = safe_name(Path(record["name"]).stem)[:64]
+    output_name = (
+        f"{stem}_partial_{frame_count:06d}f_{cache_key[:8]}_"
+        f"q{request.crf}_{stamp}_{suffix}.mp4"
+    )
+    return EXPORT_DIR / safe_name(output_name)
+
+
 def write_cache_manifest(cache_root: Path, record: dict, request: ExportRequest, status: str) -> None:
     manifest = {
         "status": status,
@@ -462,6 +516,30 @@ def reusable_frames(video_path: Path, frames_dir: Path, expected_count: int) -> 
     if frames and (expected_count <= 0 or len(frames) == expected_count):
         return frames
     return extract_frames(video_path, frames_dir)
+
+
+def contiguous_ready_frames(frames_dir: Path) -> list[Path]:
+    frames: list[Path] = []
+    index = 1
+    while True:
+        frame_path = frames_dir / f"frame_{index:06d}.png"
+        if not valid_image(frame_path):
+            break
+        frames.append(frame_path)
+        index += 1
+    return frames
+
+
+def snapshot_partial_frames(frames: list[Path], target_dir: Path) -> None:
+    target_dir.mkdir(parents=True, exist_ok=True)
+    for index, frame_path in enumerate(frames, start=1):
+        target_path = target_dir / f"frame_{index:06d}.png"
+        try:
+            os.link(frame_path, target_path)
+        except OSError:
+            shutil.copy2(frame_path, target_path)
+        if not valid_image(target_path):
+            raise RuntimeError(f"Frame {frame_path.name} was not ready for partial export")
 
 
 def eta_seconds(generation_elapsed: float, completed_misses: int, remaining_misses: int) -> float | None:
@@ -683,13 +761,6 @@ def delete_adapter(adapter_id: str) -> dict:
     }
 
 
-def latest_checkpoint_weight(output_dir: Path) -> Path | None:
-    checkpoints = checkpoint_weights(output_dir)
-    if not checkpoints:
-        return None
-    return checkpoints[-1]["weightPath"]
-
-
 def checkpoint_weights(output_dir: Path) -> list[dict]:
     checkpoints = []
     for checkpoint in output_dir.glob("checkpoint-*"):
@@ -759,15 +830,6 @@ def prune_adapter_record_checkpoints(record: dict) -> tuple[dict, bool]:
     return record, changed
 
 
-def usable_checkpoint(checkpoints: list[dict], train_params: dict[str, int]) -> dict | None:
-    if not checkpoints:
-        return None
-    min_step = min(train_params["maxTrainSteps"], train_params["checkpointingSteps"])
-    min_step = max(25, min_step)
-    usable = [checkpoint for checkpoint in checkpoints if checkpoint["step"] >= min_step]
-    return usable[-1] if usable else None
-
-
 def build_adapter_record(
     *,
     adapter_id: str,
@@ -779,18 +841,21 @@ def build_adapter_record(
     train_params: dict[str, int],
     checkpoints: list[dict],
     recovered: bool,
+    partial: bool = False,
     return_code: int | None = None,
 ) -> dict:
     checkpoint = checkpoints[-1]
     step = checkpoint["step"]
     suffix = f" {request.quality.title()}"
-    if recovered:
+    if partial:
         suffix += f" Partial Step {step}"
+    elif recovered:
+        suffix += " Recovered"
     adapter_name = f"{Path(source_record['name']).stem} Film Adapter{suffix}"
     return {
         "id": adapter_id,
         "name": adapter_name,
-        "status": "partial" if recovered else "ready",
+        "status": "partial" if partial else "ready",
         "videoId": request.videoId,
         "videoName": source_record["name"],
         "weightPath": str(checkpoint["weightPath"]),
@@ -826,7 +891,8 @@ def run_adapter_training(job_id: str, request: AdapterTrainRequest) -> None:
         source = Path(record["path"])
         metadata = record["metadata"]
         prompt = request.prompt.strip() or "film-specific restoration, natural detail, consistent texture"
-        train_params = adapter_training_params(request)
+        duration_seconds = float(metadata.get("duration") or 0)
+        train_params = adapter_training_params(request, duration_seconds)
         update_job(
             job_id,
             status="running",
@@ -836,16 +902,20 @@ def run_adapter_training(job_id: str, request: AdapterTrainRequest) -> None:
         )
         dataset = build_adapter_dataset(
             video_path=source,
-            duration_seconds=float(metadata.get("duration") or 0),
+            duration_seconds=duration_seconds,
             adapter_root=adapter_root,
             base_model_path=engine.base_model_path,
             prompt=prompt,
             max_frames=train_params["maxFrames"],
             patches_per_frame=train_params["patchesPerFrame"],
+            min_train_steps=train_params["minTrainSteps"],
             max_train_steps=train_params["maxTrainSteps"],
-            checkpointing_steps=train_params["checkpointingSteps"],
+            train_steps_per_patch=train_params["trainStepsPerPatch"],
             checkpoints_total_limit=train_params["checkpointsTotalLimit"],
         )
+        train_params["maxTrainSteps"] = dataset.max_train_steps
+        train_params["checkpointingSteps"] = dataset.checkpointing_steps
+        train_params["checkpointsTotalLimit"] = dataset.checkpoints_total_limit
         if job_id in cancelled_jobs:
             update_job(job_id, status="cancelled", progress=0.12, message="Film adapter training cancelled")
             cancelled_jobs.discard(job_id)
@@ -875,78 +945,115 @@ def run_adapter_training(job_id: str, request: AdapterTrainRequest) -> None:
             "--config",
             str(dataset.config_path),
         ]
+        resume_checkpoint_dir: Path | None = None
+        resume_step = 0
+        recovery_attempts = 0
+        recovered_from_crash = False
+        completed_from_final_checkpoint = False
+        last_trainer_return_code: int | None = None
         with log_path.open("w", encoding="utf-8", errors="replace") as log_fp:
-            log_fp.write(" ".join(command) + "\n")
-            log_fp.flush()
-            process = subprocess.Popen(
-                command,
-                cwd=HYPIR_ROOT,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                env=env,
-            )
-            job_processes[job_id] = process
-            last_update = time.monotonic()
-            assert process.stdout is not None
-            for line in process.stdout:
-                log_fp.write(line)
-                if time.monotonic() - last_update > 5:
-                    checkpoint = latest_checkpoint_weight(dataset.output_dir)
-                    progress = 0.24 if checkpoint is None else 0.55
-                    update_job(
-                        job_id,
-                        progress=progress,
-                        message=f"Training film adapter: {line.strip()[:140] or 'running'}",
+            while True:
+                set_train_config_resume_checkpoint(dataset.config_path, resume_checkpoint_dir)
+                attempt_label = (
+                    f"resume from {resume_checkpoint_dir.name}"
+                    if resume_checkpoint_dir is not None
+                    else "fresh start"
+                )
+                log_fp.write(f"\n[{now_iso()}] Starting trainer attempt: {attempt_label}\n")
+                log_fp.write(" ".join(command) + "\n")
+                log_fp.flush()
+                process = subprocess.Popen(
+                    command,
+                    cwd=HYPIR_ROOT,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    env=env,
+                )
+                job_processes[job_id] = process
+                last_update = time.monotonic()
+                assert process.stdout is not None
+                for line in process.stdout:
+                    log_fp.write(line)
+                    if time.monotonic() - last_update > 5:
+                        checkpoints_now = checkpoint_weights(dataset.output_dir)
+                        latest_step = checkpoints_now[-1]["step"] if checkpoints_now else 0
+                        progress = 0.24
+                        if latest_step:
+                            progress = min(
+                                0.88,
+                                0.20 + latest_step / max(train_params["maxTrainSteps"], 1) * 0.68,
+                            )
+                        update_job(
+                            job_id,
+                            progress=progress,
+                            message=f"Training film adapter: {line.strip()[:140] or 'running'}",
+                        )
+                        last_update = time.monotonic()
+                    if job_id in cancelled_jobs:
+                        process.terminate()
+                        try:
+                            process.wait(timeout=20)
+                        except subprocess.TimeoutExpired:
+                            process.kill()
+                        update_job(job_id, status="cancelled", progress=0.2, message="Film adapter training cancelled")
+                        cancelled_jobs.discard(job_id)
+                        return
+                return_code = process.wait()
+                job_processes.pop(job_id, None)
+                if return_code == 0:
+                    break
+
+                last_trainer_return_code = return_code
+                checkpoints = checkpoint_weights(dataset.output_dir)
+                latest_checkpoint = checkpoints[-1] if checkpoints else None
+                if latest_checkpoint and latest_checkpoint["step"] >= train_params["maxTrainSteps"]:
+                    recovered_from_crash = True
+                    completed_from_final_checkpoint = True
+                    log_fp.write(
+                        f"[{now_iso()}] Trainer exited {return_code}, "
+                        f"but final checkpoint {latest_checkpoint['step']} is complete.\n"
                     )
-                    last_update = time.monotonic()
-                if job_id in cancelled_jobs:
-                    process.terminate()
-                    try:
-                        process.wait(timeout=20)
-                    except subprocess.TimeoutExpired:
-                        process.kill()
-                    update_job(job_id, status="cancelled", progress=0.2, message="Film adapter training cancelled")
-                    cancelled_jobs.discard(job_id)
-                    return
-            return_code = process.wait()
-        if return_code != 0:
-            checkpoints = checkpoint_weights(dataset.output_dir)
-            recovered_checkpoint = usable_checkpoint(checkpoints, train_params)
-            if not recovered_checkpoint:
-                raise RuntimeError(f"HYPIR adapter training failed with exit code {return_code}. See {log_path}")
-            checkpoints = [item for item in checkpoints if item["step"] <= recovered_checkpoint["step"]]
-            checkpoints = prune_adapter_checkpoints(checkpoints, recovered_checkpoint["step"])
-            adapter_record = build_adapter_record(
-                adapter_id=adapter_id,
-                source_record=record,
-                request=request,
-                adapter_root=adapter_root,
-                prompt=prompt,
-                dataset=dataset,
-                train_params=train_params,
-                checkpoints=checkpoints,
-                recovered=True,
-                return_code=return_code,
-            )
-            adapters[adapter_id] = adapter_record
-            save_adapter_record(adapter_record)
-            update_job(
-                job_id,
-                status="done",
-                progress=1.0,
-                message=(
-                    f"Film adapter recovered from checkpoint {adapter_record['checkpointStep']} "
-                    f"after trainer exit code {return_code}"
-                ),
-                adapterId=adapter_id,
-                adapterName=adapter_record["name"],
-                outputPath=adapter_record["weightPath"],
-                etaSeconds=0,
-            )
-            return
+                    break
+
+                if not latest_checkpoint:
+                    raise RuntimeError(f"HYPIR adapter training failed with exit code {return_code}. See {log_path}")
+
+                latest_step = int(latest_checkpoint["step"])
+                if recovery_attempts >= ADAPTER_TRAINING_RECOVERY_LIMIT:
+                    progress_note = (
+                        f"and did not advance beyond checkpoint {latest_step}"
+                        if latest_step <= resume_step
+                        else f"after reaching checkpoint {latest_step}"
+                    )
+                    raise RuntimeError(
+                        f"HYPIR adapter training failed with exit code {return_code} "
+                        f"after {recovery_attempts} recovery attempts {progress_note}. See {log_path}"
+                    )
+
+                recovery_attempts += 1
+                recovered_from_crash = True
+                if latest_step > resume_step or resume_checkpoint_dir is None:
+                    resume_step = latest_step
+                    resume_checkpoint_dir = Path(latest_checkpoint["weightPath"]).parent
+                log_fp.write(
+                    f"[{now_iso()}] Trainer exited {return_code}; "
+                    f"resuming from checkpoint {resume_step} "
+                    f"({recovery_attempts}/{ADAPTER_TRAINING_RECOVERY_LIMIT}).\n"
+                )
+                log_fp.flush()
+                update_job(
+                    job_id,
+                    progress=min(0.9, 0.20 + resume_step / max(train_params["maxTrainSteps"], 1) * 0.68),
+                    message=(
+                        f"Trainer exited with code {return_code}; "
+                        f"resuming film adapter from checkpoint {resume_step} "
+                        f"({recovery_attempts}/{ADAPTER_TRAINING_RECOVERY_LIMIT})"
+                    ),
+                    etaSeconds=None,
+                )
 
         checkpoints = checkpoint_weights(dataset.output_dir)
         if not checkpoints:
@@ -961,15 +1068,30 @@ def run_adapter_training(job_id: str, request: AdapterTrainRequest) -> None:
             dataset=dataset,
             train_params=train_params,
             checkpoints=checkpoints,
-            recovered=False,
+            recovered=recovered_from_crash,
+            return_code=last_trainer_return_code,
         )
         adapters[adapter_id] = adapter_record
+        cleanup_message = "Cleaned temporary training files"
+        try:
+            cleanup_adapter_training_artifacts(adapter_root, Path(adapter_record["weightPath"]).parent)
+        except Exception as exc:
+            cleanup_message = f"Temporary training cleanup failed: {exc}"
         save_adapter_record(adapter_record)
+        if completed_from_final_checkpoint:
+            ready_message = (
+                f"Film adapter ready from final checkpoint {adapter_record['checkpointStep']} "
+                f"after trainer exit code {last_trainer_return_code}"
+            )
+        elif recovered_from_crash:
+            ready_message = f"Film adapter ready after recovery: {adapter_record['name']}"
+        else:
+            ready_message = f"Film adapter ready: {adapter_record['name']}"
         update_job(
             job_id,
             status="done",
             progress=1.0,
-            message=f"Film adapter ready: {adapter_record['name']}",
+            message=f"{ready_message}. {cleanup_message}.",
             adapterId=adapter_id,
             adapterName=adapter_record["name"],
             outputPath=adapter_record["weightPath"],
@@ -1029,8 +1151,11 @@ def open_output_folder() -> dict:
 def cleanup_generated() -> dict:
     with jobs_lock:
         active_jobs = [job.id for job in jobs.values() if job.status in {"queued", "running"}]
+        active_partials = len(partial_exports_active)
     if active_jobs:
         raise HTTPException(status_code=409, detail="Cannot clean generated files while an export is running")
+    if active_partials:
+        raise HTTPException(status_code=409, detail="Cannot clean generated files while a partial video is being saved")
     try:
         result = clear_generated_dirs()
     except Exception as exc:
@@ -1039,6 +1164,7 @@ def cleanup_generated() -> dict:
         jobs.clear()
         job_frame_events.clear()
     cancelled_jobs.clear()
+    partial_exports_active.clear()
     return result
 
 
@@ -1129,6 +1255,7 @@ def run_export(job_id: str, request: ExportRequest) -> None:
                 etaSeconds=0,
                 framesDone=expected_count,
                 framesTotal=expected_count,
+                partialFramesReady=expected_count,
                 cacheKey=cache_key,
                 outputUrl=f"/media/exports/{output_path.name}",
                 outputPath=str(output_path),
@@ -1169,6 +1296,7 @@ def run_export(job_id: str, request: ExportRequest) -> None:
         missing_total = sum(1 for _, _, cached in outputs if not cached)
         cache_hits = total - missing_total
         cache_misses_done = 0
+        partial_frames_ready = len(contiguous_ready_frames(enhanced_frames))
         generation_elapsed = 0.0
         latest_frame_seq = 0
         temporal_enabled = temporal_mode_enabled(request.temporalConsistency)
@@ -1212,6 +1340,7 @@ def run_export(job_id: str, request: ExportRequest) -> None:
                     currentFrameSeconds=(frame_index - 1) / fps,
                     currentOriginalUrl=media_url(frame),
                     currentEnhancedUrl=media_url(adapter_output) if valid_image(adapter_output) else None,
+                    partialFramesReady=partial_frames_ready,
                     cacheHits=cache_hits,
                     cacheMisses=cache_misses_done,
                 )
@@ -1288,6 +1417,7 @@ def run_export(job_id: str, request: ExportRequest) -> None:
 
                 frame_seconds = (index - 1) / fps
                 remaining_misses = max(0, missing_total - cache_misses_done)
+                partial_frames_ready = max(partial_frames_ready, index)
                 update_job(
                     job_id,
                     progress=0.45 + index / max(total, 1) * 0.44,
@@ -1300,6 +1430,7 @@ def run_export(job_id: str, request: ExportRequest) -> None:
                     currentOriginalUrl=media_url(frame),
                     currentEnhancedUrl=media_url(output),
                     latestFrameSeq=latest_frame_seq,
+                    partialFramesReady=partial_frames_ready,
                     cacheHits=cache_hits,
                     cacheMisses=cache_misses_done,
                 )
@@ -1372,6 +1503,7 @@ def run_export(job_id: str, request: ExportRequest) -> None:
 
                 frame_seconds = (index - 1) / fps
                 remaining_misses = max(0, missing_total - cache_misses_done)
+                partial_frames_ready = max(partial_frames_ready, index)
                 update_job(
                     job_id,
                     progress=0.05 + index / max(total, 1) * 0.84,
@@ -1384,6 +1516,7 @@ def run_export(job_id: str, request: ExportRequest) -> None:
                     currentOriginalUrl=media_url(frame),
                     currentEnhancedUrl=media_url(output),
                     latestFrameSeq=latest_frame_seq,
+                    partialFramesReady=partial_frames_ready,
                     cacheHits=cache_hits,
                     cacheMisses=cache_misses_done,
                 )
@@ -1415,6 +1548,7 @@ def run_export(job_id: str, request: ExportRequest) -> None:
             etaSeconds=0,
             framesDone=total,
             framesTotal=total,
+            partialFramesReady=total,
             outputUrl=f"/media/exports/{output_path.name}",
             outputPath=str(output_path),
         )
@@ -1465,6 +1599,69 @@ def get_job(job_id: str) -> dict:
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
     return job.model_dump()
+
+
+@app.post("/api/jobs/{job_id}/partial-export")
+def export_partial_video(job_id: str, request: PartialExportRequest) -> dict:
+    partial_token = uuid.uuid4().hex
+    partial_root = PARTIAL_DIR / partial_token
+    partial_frames = partial_root / "frames"
+    with jobs_lock:
+        job = jobs.get(job_id)
+        if not job:
+            raise HTTPException(status_code=404, detail="Job not found")
+        job_snapshot = job.model_dump()
+        partial_exports_active.add(partial_token)
+
+    try:
+        if job_snapshot["kind"] != "export":
+            raise HTTPException(status_code=400, detail="Partial video is only available for export jobs")
+        if job_snapshot["status"] not in {"running", "done"}:
+            raise HTTPException(status_code=409, detail="Export has not started producing frames yet")
+        if not job_snapshot.get("videoId"):
+            raise HTTPException(status_code=400, detail="Export job is missing its source video")
+        cache_key = job_snapshot.get("cacheKey")
+        if not cache_key:
+            raise HTTPException(status_code=409, detail="Export is still preparing the frame cache")
+
+        record = get_video(job_snapshot["videoId"])
+        source = Path(record["path"])
+        metadata = record["metadata"]
+        fps = float(metadata.get("fps") or 30.0)
+        enhanced_frames = CACHE_DIR / cache_key / "enhanced"
+        ready_frames = contiguous_ready_frames(enhanced_frames)
+        frame_count = len(ready_frames)
+        if frame_count <= 0:
+            raise HTTPException(status_code=409, detail="No enhanced frames are ready yet")
+
+        snapshot_partial_frames(ready_frames, partial_frames)
+        output_path = partial_output_path(record, cache_key, frame_count, request)
+        try:
+            selected_encoder = encode_video(
+                partial_frames,
+                source,
+                output_path,
+                fps=fps,
+                crf=request.crf,
+                encoder=request.encoder,
+                frame_count=frame_count,
+            )
+        except Exception as exc:
+            output_path.unlink(missing_ok=True)
+            raise HTTPException(status_code=500, detail=f"Partial export failed: {exc}") from exc
+
+        return {
+            "outputUrl": f"/media/exports/{output_path.name}",
+            "outputPath": str(output_path),
+            "framesDone": frame_count,
+            "framesTotal": job_snapshot.get("framesTotal") or int(metadata.get("frameCount") or 0),
+            "durationSeconds": frame_count / fps if fps > 0 else 0,
+            "encoder": selected_encoder,
+        }
+    finally:
+        remove_generated_path(partial_root, recreate=False)
+        with jobs_lock:
+            partial_exports_active.discard(partial_token)
 
 
 @app.get("/api/jobs/{job_id}/frames")

@@ -125,6 +125,7 @@ def encode_video(
     fps: float,
     crf: int,
     encoder: str = "auto",
+    frame_count: int | None = None,
 ) -> str:
     output_path.parent.mkdir(parents=True, exist_ok=True)
     selected = encoder
@@ -149,6 +150,8 @@ def encode_video(
         "1:a?",
     ]
     tail_args = ["-c:a", "copy", "-shortest", "-movflags", "+faststart", str(output_path)]
+    if frame_count is not None:
+        tail_args = ["-frames:v", str(frame_count)] + tail_args
 
     if selected == "h264_nvenc":
         video_args = [
@@ -200,4 +203,3 @@ def encode_video(
         else:
             raise
     return selected
-
