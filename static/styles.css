@@ -44,6 +44,10 @@ button {
   cursor: pointer;
 }
 
+.file-button {
+  cursor: pointer;
+}
+
 .app-shell {
   display: grid;
   grid-template-columns: 264px minmax(620px, 1fr) 316px;
