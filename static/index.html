@@ -4,7 +4,7 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>CleanVideo</title>
-    <link rel="stylesheet" href="/styles.css?v=2026-06-11-film-adapter-v4" />
+    <link rel="stylesheet" href="/styles.css?v=2026-06-12-film-adapter-v6" />
   </head>
   <body>
     <main class="app-shell">
@@ -42,6 +42,83 @@
           <div class="status-row">
             <span>Model</span>
             <strong id="modelStatus">cold</strong>
+          </div>
+        </section>
+
+        <section class="rail-section film-adapter-rail">
+          <h2>Film Adapter</h2>
+          <div class="field">
+            <span class="field-label">
+              Adapter
+              <button
+                class="help-button"
+                type="button"
+                aria-label="Film Adapter help"
+                data-tooltip="Optional film-specific HYPIR LoRA adapter. Create Film Adapter samples this video, trains a small local adapter, and then lets preview/export use it. Training can take a long time and may overfit noisy source material."
+              >?</button>
+            </span>
+            <div class="adapter-select-row">
+              <select id="adapterSelect" aria-label="Film Adapter">
+                <option value="base">Base HYPIR</option>
+              </select>
+              <button
+                id="deleteAdapterButton"
+                class="danger-button icon-button"
+                type="button"
+                aria-label="Delete selected film adapter"
+                title="Delete selected film adapter"
+                disabled
+              >
+                <svg viewBox="0 0 24 24" aria-hidden="true">
+                  <path d="M3 6h18M8 6V4h8v2M6 6l1 15h10l1-15M10 11v6M14 11v6"/>
+                </svg>
+              </button>
+            </div>
+          </div>
+          <div class="field">
+            <span class="field-label">
+              Second Pass
+              <button
+                class="help-button"
+                type="button"
+                aria-label="Second Pass help"
+                data-tooltip="Optional refinement pass for film adapters. Base after adapter first enhances with the selected film adapter, then runs Base HYPIR at 1x on that result. It is much slower and can add extra sharpening, so compare with preview before export."
+              >?</button>
+            </span>
+            <select id="secondPass" aria-label="Second Pass">
+              <option value="off" selected>Off</option>
+              <option value="base_after_adapter">Base after adapter</option>
+            </select>
+          </div>
+          <div class="field">
+            <span class="field-label">
+              Adapter Quality
+              <button
+                class="help-button"
+                type="button"
+                aria-label="Adapter Quality help"
+                data-tooltip="Controls how much of the selected film is sampled before Create Film Adapter. Fast is a short test, High samples more scenes and trains longer, Extra is slowest. Temporary checkpoints are used during training; only the latest usable checkpoint is kept."
+              >?</button>
+            </span>
+            <select id="adapterQuality" aria-label="Adapter Quality">
+              <option value="fast" selected>Fast</option>
+              <option value="high">High</option>
+              <option value="extra">Extra</option>
+            </select>
+          </div>
+          <div class="field adapter-actions">
+            <button id="trainAdapterButton" class="secondary-button" type="button" disabled>
+              <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3v18M5 12h14M6 19l12-14"/></svg>
+              Create Film Adapter
+            </button>
+            <button id="cancelAdapterButton" class="danger-button" type="button" hidden>
+              <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 6l12 12M18 6 6 18"/></svg>
+              Stop Adapter
+            </button>
+            <button id="deleteAllAdaptersButton" class="danger-button" type="button" disabled>
+              <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 6h18M8 6V4h8v2M6 6l1 15h10l1-15M10 11v6M14 11v6"/></svg>
+              Delete All Adapters
+            </button>
           </div>
         </section>
       </aside>
@@ -235,79 +312,6 @@
           </div>
           <div class="field">
             <span class="field-label">
-              Film Adapter
-              <button
-                class="help-button"
-                type="button"
-                aria-label="Film Adapter help"
-                data-tooltip="Optional film-specific HYPIR LoRA adapter. Create Film Adapter samples this video, trains a small local adapter, and then lets preview/export use it. Training can take a long time and may overfit noisy source material."
-              >?</button>
-            </span>
-            <div class="adapter-select-row">
-              <select id="adapterSelect" aria-label="Film Adapter">
-                <option value="base">Base HYPIR</option>
-              </select>
-              <button
-                id="deleteAdapterButton"
-                class="danger-button icon-button"
-                type="button"
-                aria-label="Delete selected film adapter"
-                title="Delete selected film adapter"
-                disabled
-              >
-                <svg viewBox="0 0 24 24" aria-hidden="true">
-                  <path d="M3 6h18M8 6V4h8v2M6 6l1 15h10l1-15M10 11v6M14 11v6"/>
-                </svg>
-              </button>
-            </div>
-          </div>
-          <div class="field">
-            <span class="field-label">
-              Second Pass
-              <button
-                class="help-button"
-                type="button"
-                aria-label="Second Pass help"
-                data-tooltip="Optional refinement pass for film adapters. Base after adapter first enhances with the selected film adapter, then runs Base HYPIR at 1x on that result. It is much slower and can add extra sharpening, so compare with preview before export."
-              >?</button>
-            </span>
-            <select id="secondPass" aria-label="Second Pass">
-              <option value="off" selected>Off</option>
-              <option value="base_after_adapter">Base after adapter</option>
-            </select>
-          </div>
-          <div class="field">
-            <span class="field-label">
-              Adapter Quality
-              <button
-                class="help-button"
-                type="button"
-                aria-label="Adapter Quality help"
-                data-tooltip="Controls how much of the selected film is sampled before Create Film Adapter. Fast is a short test, High samples more scenes and trains longer, Extra is slowest and keeps more checkpoints for comparison."
-              >?</button>
-            </span>
-            <select id="adapterQuality" aria-label="Adapter Quality">
-              <option value="fast" selected>Fast</option>
-              <option value="high">High</option>
-              <option value="extra">Extra</option>
-            </select>
-          </div>
-          <div class="field adapter-actions">
-            <button id="trainAdapterButton" class="secondary-button" type="button" disabled>
-              <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3v18M5 12h14M6 19l12-14"/></svg>
-              Create Film Adapter
-            </button>
-            <button id="cancelAdapterButton" class="danger-button" type="button" hidden>
-              <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 6l12 12M18 6 6 18"/></svg>
-              Stop Adapter
-            </button>
-            <button id="deleteAllAdaptersButton" class="danger-button" type="button" disabled>
-              <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 6h18M8 6V4h8v2M6 6l1 15h10l1-15M10 11v6M14 11v6"/></svg>
-              Delete All Adapters
-            </button>
-          </div>
-          <div class="field">
-            <span class="field-label">
               Seed
               <button
                 class="help-button"
@@ -366,6 +370,6 @@
         </section>
       </aside>
     </main>
-    <script src="/app.js?v=2026-06-11-film-adapter-v4" type="module"></script>
+    <script src="/app.js?v=2026-06-12-film-adapter-v6" type="module"></script>
   </body>
 </html>

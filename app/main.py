@@ -48,7 +48,7 @@ ADAPTER_DIR = WORK_DIR / "adapters"
 for directory in [UPLOAD_DIR, PREVIEW_DIR, EXPORT_DIR, JOB_DIR, CACHE_DIR, ADAPTER_DIR]:
     directory.mkdir(parents=True, exist_ok=True)
 GENERATED_DIRS = [PREVIEW_DIR, CACHE_DIR, JOB_DIR, EXPORT_DIR]
-APP_BUILD = "2026-06-11-film-adapter-v4"
+APP_BUILD = "2026-06-12-film-adapter-v6"
 
 AdapterQuality = Literal["fast", "high", "extra"]
 SecondPassMode = Literal["off", "base_after_adapter"]
@@ -263,6 +263,9 @@ def load_adapter_records() -> None:
                             {"step": item["step"], "weightPath": str(item["weightPath"])}
                             for item in checkpoints
                         ]
+                record, changed = prune_adapter_record_checkpoints(record)
+                if changed:
+                    save_adapter_record(record)
                 adapters[record["id"]] = record
         except Exception:
             continue
@@ -286,25 +289,11 @@ def list_adapter_records() -> list[dict]:
 
 def adapter_select_records(record: dict) -> list[dict]:
     checkpoints = record.get("checkpoints") or []
-    visible = [dict(record)]
+    visible = dict(record)
     if checkpoints:
         latest_step = record.get("checkpointStep") or checkpoints[-1].get("step")
-        visible[0]["name"] = f"{record['name']} (latest step {latest_step})"
-        for checkpoint in sorted(checkpoints, key=lambda item: item.get("step") or 0, reverse=True):
-            if str(checkpoint.get("weightPath")) == str(record.get("weightPath")):
-                continue
-            step = checkpoint.get("step")
-            weight_path = Path(checkpoint.get("weightPath", ""))
-            if not step or not weight_path.exists():
-                continue
-            option = dict(record)
-            option["id"] = f"{record['id']}@step-{step}"
-            option["name"] = f"{record['name']} (step {step})"
-            option["weightPath"] = str(weight_path)
-            option["checkpointStep"] = step
-            option["parentAdapterId"] = record["id"]
-            visible.append(option)
-    return visible
+        visible["name"] = f"{record['name']} (latest step {latest_step})"
+    return [visible]
 
 
 def get_adapter_weight_path(adapter_id: str) -> Path | None:
@@ -716,6 +705,60 @@ def checkpoint_weights(output_dir: Path) -> list[dict]:
     return sorted(checkpoints, key=lambda item: item["step"])
 
 
+def prune_adapter_checkpoints(checkpoints: list[dict], keep_step: int) -> list[dict]:
+    kept: list[dict] = []
+    for item in checkpoints:
+        step = item.get("step")
+        weight_path = Path(item.get("weightPath", ""))
+        if step == keep_step:
+            if weight_path.exists():
+                kept.append({"step": step, "weightPath": weight_path})
+            continue
+
+        checkpoint_dir = weight_path.parent
+        if checkpoint_dir.name.startswith("checkpoint-"):
+            ensure_adapter_path(checkpoint_dir)
+            if checkpoint_dir.exists():
+                shutil.rmtree(checkpoint_dir, onerror=handle_remove_readonly)
+    return sorted(kept, key=lambda item: item["step"])
+
+
+def prune_adapter_record_checkpoints(record: dict) -> tuple[dict, bool]:
+    checkpoints = []
+    for item in record.get("checkpoints") or []:
+        try:
+            step = int(item["step"])
+        except Exception:
+            continue
+        weight_path = Path(item.get("weightPath", ""))
+        if weight_path.exists():
+            checkpoints.append({"step": step, "weightPath": weight_path})
+
+    if not checkpoints:
+        return record, False
+
+    checkpoints = sorted(checkpoints, key=lambda item: item["step"])
+    keep_step = record.get("checkpointStep") or checkpoints[-1]["step"]
+    if not any(item["step"] == keep_step for item in checkpoints):
+        keep_step = checkpoints[-1]["step"]
+
+    kept = prune_adapter_checkpoints(checkpoints, int(keep_step))
+    if not kept:
+        return record, False
+
+    new_checkpoints = [
+        {"step": item["step"], "weightPath": str(item["weightPath"])}
+        for item in kept
+    ]
+    changed = record.get("checkpointStep") != kept[-1]["step"]
+    changed = changed or record.get("weightPath") != str(kept[-1]["weightPath"])
+    changed = changed or record.get("checkpoints") != new_checkpoints
+    record["checkpointStep"] = kept[-1]["step"]
+    record["weightPath"] = str(kept[-1]["weightPath"])
+    record["checkpoints"] = new_checkpoints
+    return record, changed
+
+
 def usable_checkpoint(checkpoints: list[dict], train_params: dict[str, int]) -> dict | None:
     if not checkpoints:
         return None
@@ -875,6 +918,7 @@ def run_adapter_training(job_id: str, request: AdapterTrainRequest) -> None:
             if not recovered_checkpoint:
                 raise RuntimeError(f"HYPIR adapter training failed with exit code {return_code}. See {log_path}")
             checkpoints = [item for item in checkpoints if item["step"] <= recovered_checkpoint["step"]]
+            checkpoints = prune_adapter_checkpoints(checkpoints, recovered_checkpoint["step"])
             adapter_record = build_adapter_record(
                 adapter_id=adapter_id,
                 source_record=record,
@@ -907,6 +951,7 @@ def run_adapter_training(job_id: str, request: AdapterTrainRequest) -> None:
         checkpoints = checkpoint_weights(dataset.output_dir)
         if not checkpoints:
             raise RuntimeError(f"Training finished, but no checkpoint state_dict.pth was found under {dataset.output_dir}")
+        checkpoints = prune_adapter_checkpoints(checkpoints, checkpoints[-1]["step"])
         adapter_record = build_adapter_record(
             adapter_id=adapter_id,
             source_record=record,

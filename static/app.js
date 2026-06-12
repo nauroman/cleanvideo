@@ -275,7 +275,8 @@ async function loadAdapters(selectedId = els.adapterSelect.value || "base") {
     option.textContent = adapter.name || adapter.id;
     els.adapterSelect.appendChild(option);
   }
-  els.adapterSelect.value = ids.has(selectedId) ? selectedId : "base";
+  const rootSelectedId = String(selectedId).split("@step-", 1)[0];
+  els.adapterSelect.value = ids.has(selectedId) ? selectedId : ids.has(rootSelectedId) ? rootSelectedId : "base";
   updateDeleteAdapterButton();
 }
 
