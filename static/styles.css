@@ -436,6 +436,7 @@ svg {
 }
 
 .media-box {
+  --video-controls-gutter: 22px;
   position: relative;
   display: grid;
   width: 100%;
@@ -460,11 +461,21 @@ svg {
 .media-box video,
 .media-box img {
   display: block;
+  max-width: 100%;
+  object-fit: contain;
+}
+
+.media-box video {
+  align-self: start;
+  width: 100%;
+  height: calc(100% - var(--video-controls-gutter));
+  max-height: calc(100% - var(--video-controls-gutter));
+}
+
+.media-box img {
   width: 100%;
   height: 100%;
-  max-width: 100%;
   max-height: calc(100vh - 210px);
-  object-fit: contain;
 }
 
 .comparison-box {

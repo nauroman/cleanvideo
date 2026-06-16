@@ -2,10 +2,15 @@ const defaultEngine = "flashvsr";
 const settingsStorageVersion = 3;
 const settingsStorageKey = "cleanvideo.session.v1";
 const engineMetricsStorageKey = "cleanvideo.engineMetrics.v1";
-const previewTimeoutMsByEngine = {
+const previewBaseTimeoutMsByEngine = {
   flashvsr: 5 * 60 * 1000,
   seedvr2: 3 * 60 * 1000,
   hypir: 2 * 60 * 1000,
+};
+const previewMaxTimeoutMsByEngine = {
+  flashvsr: 12 * 60 * 1000,
+  seedvr2: 12 * 60 * 1000,
+  hypir: 5 * 60 * 1000,
 };
 
 const state = {
@@ -208,6 +213,28 @@ function formatDuration(seconds) {
     return `${minutes}m ${String(secs).padStart(2, "0")}s`;
   }
   return `${secs}s`;
+}
+
+function sourceLongestSide() {
+  const metadata = state.video?.metadata || {};
+  return Math.max(Number(metadata.width) || 0, Number(metadata.height) || 0, 1);
+}
+
+function requestedPreviewLongestSide(settings) {
+  if (settings.scaleBy === "longest_side") {
+    return Math.max(1, Number(settings.targetLongestSide) || sourceLongestSide());
+  }
+  const factor = Math.max(1, Math.min(4, Number(settings.upscale) || 1));
+  return Math.max(1, Math.round(sourceLongestSide() * factor));
+}
+
+function previewTimeoutMs(settings) {
+  const base = previewBaseTimeoutMsByEngine[state.engine] || 2 * 60 * 1000;
+  const max = previewMaxTimeoutMsByEngine[state.engine] || base;
+  const targetLongestSide = requestedPreviewLongestSide(settings);
+  const areaRatio = Math.max(1, targetLongestSide / 1280) ** 2;
+  const scaled = base * Math.min(4, areaRatio);
+  return Math.min(max, Math.max(base, Math.round(scaled)));
 }
 
 function formatBytes(bytes) {
@@ -1120,20 +1147,21 @@ async function runAutoPreview({ manual = false } = {}) {
   setActivity(state.engine === "hypir" ? "Enhancing preview" : `Running ${selectedLabel} preview`, 0.2);
   let timedOut = false;
   let timeoutId = null;
+  let timeoutMs = previewBaseTimeoutMsByEngine[state.engine] || 2 * 60 * 1000;
   try {
     const controller = new AbortController();
     state.previewController = controller;
-    const timeoutMs = previewTimeoutMsByEngine[state.engine] || 2 * 60 * 1000;
-    timeoutId = window.setTimeout(() => {
-      timedOut = true;
-      controller.abort();
-      fetch("/api/preview/cancel", { method: "POST" }).catch(() => {});
-    }, timeoutMs);
     const body = {
       videoId: state.video.id,
       seconds: Number(els.timeline.value),
       ...collectSettings(),
     };
+    timeoutMs = previewTimeoutMs(body);
+    timeoutId = window.setTimeout(() => {
+      timedOut = true;
+      controller.abort();
+      fetch("/api/preview/cancel", { method: "POST" }).catch(() => {});
+    }, timeoutMs);
     const preview = await api("/api/preview", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -1159,7 +1187,7 @@ async function runAutoPreview({ manual = false } = {}) {
     await refreshStatus();
   } catch (error) {
     if (timedOut && version === state.previewVersion) {
-      setActivity("Preview timed out and was cancelled", 0);
+      setActivity(`Preview timed out after ${formatDuration(timeoutMs / 1000)} and was cancelled`, 0);
     } else if (error.name !== "AbortError" && !String(error.message || "").toLowerCase().includes("cancelled")) {
       setActivity(`Preview failed: ${error.message}`, 0);
     }

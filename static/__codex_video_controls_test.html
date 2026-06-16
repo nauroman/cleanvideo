@@ -1,0 +1,83 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>CleanVideo CSS video controls test</title>
+    <link rel="stylesheet" href="/styles.css?v=2026-06-16-clean-all-work-v25-ui-fit-v2" />
+  </head>
+  <body>
+    <main class="app-shell">
+      <aside class="engine-rail">
+        <div class="brand">
+          <div class="brand-mark">CV</div>
+          <div>
+            <h1>CleanVideo</h1>
+            <p>Local restoration</p>
+          </div>
+        </div>
+      </aside>
+      <section class="workspace">
+        <header class="topbar">
+          <div class="upload-area">
+            <label class="file-button"><span>Choose Video</span></label>
+            <div class="video-title">
+              <strong>v2.mp4</strong>
+              <span>852x480 | 30.000 fps | 00:53.733 | h264</span>
+            </div>
+          </div>
+        </header>
+        <section class="viewer-grid">
+          <article class="viewer-pane comparison-pane">
+            <div class="pane-head">
+              <span>Preview</span>
+              <small>
+                <span>source frame</span>
+                <span class="pane-head-divider">|</span>
+                <span>FlashVSR auto preview</span>
+              </small>
+            </div>
+            <div class="media-box comparison-box">
+              <video
+                id="sourceVideo"
+                controls
+                muted
+                playsinline
+                src="/media/uploads/ad33532ac31d45d182cafd31bb90a052_v2.mp4"
+              ></video>
+            </div>
+          </article>
+        </section>
+        <section class="timeline-panel">
+          <div class="timeline-top">
+            <span>00:00.000</span>
+            <span>00:53.733</span>
+          </div>
+          <input class="timeline" type="range" min="0" max="53.733" step="0.033" value="0" />
+          <div class="timeline-actions">
+            <button id="exportButton" class="secondary-button" type="button">Render Video</button>
+            <button class="secondary-button" type="button">Open Output Folder</button>
+            <button class="danger-button" type="button">Clean All</button>
+            <span id="activityText">CSS video control test</span>
+          </div>
+          <div class="progress-meta">
+            <span>Frames: --</span>
+            <span>ETA: --</span>
+          </div>
+          <div class="progress-wrap">
+            <div class="progress-bar" style="width: 20%"></div>
+          </div>
+        </section>
+      </section>
+      <aside class="inspector">
+        <section class="panel">
+          <h2>Resolution</h2>
+          <div class="field">
+            <span>Scale Mode</span>
+            <select><option>Scale factor</option></select>
+          </div>
+        </section>
+      </aside>
+    </main>
+  </body>
+</html>

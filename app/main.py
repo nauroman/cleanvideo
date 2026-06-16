@@ -72,7 +72,7 @@ def ensure_work_directories() -> None:
 
 ensure_work_directories()
 GENERATED_DIRS = [PREVIEW_DIR, CACHE_DIR, PARTIAL_DIR, JOB_DIR, EXPORT_DIR]
-APP_BUILD = "2026-06-16-clean-all-work-v25"
+APP_BUILD = "2026-06-16-adaptive-preview-timeout-v26"
 ADAPTER_TRAINING_RECOVERY_LIMIT = 3
 FLASHVSR_PREVIEW_DEFAULT_LONGEST_SIDE = 1280
 FLASHVSR_PREVIEW_FRAMES = 21
@@ -314,6 +314,22 @@ preview_lock = threading.Lock()
 preview_generation = 0
 cancelled_previews: set[int] = set()
 preview_processes: dict[int, subprocess.Popen] = {}
+active_preview_tokens: set[int] = set()
+cleanup_in_progress = False
+
+
+class CleanupBlockedByPreview(RuntimeError):
+    def __init__(self, active_count: int, cancelled_processes: int) -> None:
+        self.active_count = active_count
+        self.cancelled_processes = cancelled_processes
+        super().__init__(
+            f"Cannot clean work files while {active_count} preview request"
+            f"{'' if active_count == 1 else 's'} are still finishing"
+        )
+
+
+class CleanupAlreadyRunning(RuntimeError):
+    pass
 
 
 def now_iso() -> str:
@@ -347,12 +363,15 @@ def terminate_process(process: subprocess.Popen, timeout: float = 5.0) -> None:
 def start_preview_run() -> int:
     global preview_generation
     with preview_lock:
+        if cleanup_in_progress:
+            raise RuntimeError("Cleanup is in progress")
         preview_generation += 1
         token = preview_generation
         stale = list(preview_processes.items())
         for stale_token, _process in stale:
             cancelled_previews.add(stale_token)
         preview_processes.clear()
+        active_preview_tokens.add(token)
 
     for _stale_token, process in stale:
         terminate_process(process)
@@ -364,13 +383,47 @@ def cancel_preview_runs() -> int:
     with preview_lock:
         preview_generation += 1
         stale = list(preview_processes.items())
-        for stale_token, _process in stale:
-            cancelled_previews.add(stale_token)
+        for token in active_preview_tokens:
+            cancelled_previews.add(token)
         preview_processes.clear()
 
     for _stale_token, process in stale:
         terminate_process(process)
     return len(stale)
+
+
+def begin_cleanup_window() -> dict:
+    global preview_generation, cleanup_in_progress
+    with preview_lock:
+        if cleanup_in_progress:
+            raise CleanupAlreadyRunning("Cleanup is already running")
+        preview_generation += 1
+        stale = list(preview_processes.items())
+        for token in active_preview_tokens:
+            cancelled_previews.add(token)
+        preview_processes.clear()
+        active_count = len(active_preview_tokens)
+        if active_count:
+            cleanup_in_progress = False
+        else:
+            cleanup_in_progress = True
+
+    for _stale_token, process in stale:
+        terminate_process(process)
+    if active_count:
+        raise CleanupBlockedByPreview(active_count, len(stale))
+    return {"cancelledPreviews": len(stale)}
+
+
+def finish_cleanup_window() -> None:
+    global cleanup_in_progress
+    with preview_lock:
+        cleanup_in_progress = False
+
+
+def active_preview_count() -> int:
+    with preview_lock:
+        return len(active_preview_tokens)
 
 
 def register_preview_process(token: int, process: subprocess.Popen) -> None:
@@ -394,6 +447,7 @@ def finish_preview_run(token: int) -> None:
     with preview_lock:
         preview_processes.pop(token, None)
         cancelled_previews.discard(token)
+        active_preview_tokens.discard(token)
 
 
 def video_meta_path(video_id: str) -> Path:
@@ -1157,6 +1211,7 @@ def clear_work_runtime_state() -> None:
     cancelled_jobs.clear()
     partial_exports_active.clear()
     with preview_lock:
+        preview_processes.clear()
         cancelled_previews.clear()
 
 
@@ -1174,6 +1229,7 @@ def health() -> dict:
         "app": "CleanVideo",
         "build": APP_BUILD,
         "activeJobs": active_jobs,
+        "activePreviews": active_preview_count(),
     }
 
 
@@ -1200,6 +1256,7 @@ def status() -> dict:
         "videos": len(videos),
         "jobs": len(jobs),
         "activeJobs": active_jobs,
+        "activePreviews": active_preview_count(),
     }
 
 
@@ -1714,14 +1771,27 @@ def cleanup_generated() -> dict:
         raise HTTPException(status_code=409, detail="Cannot clean work files while a job is running")
     if active_partials:
         raise HTTPException(status_code=409, detail="Cannot clean work files while a partial video is being saved")
-    cancelled_previews_count = cancel_preview_runs()
-    unloaded = engine.unload_if_weight_under(WORK_DIR)
     try:
+        cleanup_window = begin_cleanup_window()
+    except CleanupAlreadyRunning as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except CleanupBlockedByPreview as exc:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"{exc}. Cancelled {exc.cancelled_processes} preview worker"
+                f"{'' if exc.cancelled_processes == 1 else 's'}; try Clean All again after preview stops."
+            ),
+        ) from exc
+    try:
+        unloaded = engine.unload_if_weight_under(WORK_DIR)
         result = clear_work_dir()
+        clear_work_runtime_state()
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Cleanup failed: {exc}") from exc
-    clear_work_runtime_state()
-    result["cancelledPreviews"] = cancelled_previews_count
+    finally:
+        finish_cleanup_window()
+    result["cancelledPreviews"] = cleanup_window["cancelledPreviews"]
     result["unloadedModel"] = unloaded
     return result
 
@@ -1758,7 +1828,10 @@ async def upload_video(file: UploadFile = File(...)) -> dict:
 def preview_frame(request: PreviewRequest) -> dict:
     record = get_video(request.videoId)
     ensure_engine_ready(request.engine)
-    preview_token = start_preview_run()
+    try:
+        preview_token = start_preview_run()
+    except RuntimeError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     preview_id = uuid.uuid4().hex
     preview_root = PREVIEW_DIR / preview_id
     original = preview_root / "original.png"
