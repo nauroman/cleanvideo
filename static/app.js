@@ -39,6 +39,8 @@ const state = {
   lastDisplayedFrameSeq: 0,
   lastExportFramesDone: 0,
   lastExportFramesTotal: 0,
+  jobPollFailures: 0,
+  adapterPollFailures: 0,
   status: null,
   engineMetrics: {},
 };
@@ -535,7 +537,9 @@ async function api(path, options = {}) {
     } catch {
       detail = await response.text();
     }
-    throw new Error(detail);
+    const error = new Error(detail);
+    error.status = response.status;
+    throw error;
   }
   return response.json();
 }
@@ -887,6 +891,7 @@ function resumeExportJob(job, { restoredVideo = false } = {}) {
   state.exportInFlight = true;
   state.previewDirty = false;
   state.currentJobId = job.id;
+  state.jobPollFailures = 0;
   setExportEnabled(false);
   if (restoredVideo) {
     window.clearTimeout(state.previewTimer);
@@ -925,6 +930,7 @@ async function restoreActiveAdapter(savedJobId) {
 function resumeAdapterJob(job) {
   state.adapterInFlight = true;
   state.currentAdapterJobId = job.id;
+  state.adapterPollFailures = 0;
   updateAdapterJobUi(job);
   setExportEnabled(false);
   saveLocalState();
@@ -1479,6 +1485,7 @@ function pollAdapterJob(jobId) {
   state.adapterTimer = setInterval(async () => {
     try {
       const job = await api(`/api/jobs/${jobId}`);
+      state.adapterPollFailures = 0;
       updateAdapterJobUi(job);
       if (job.status === "done") {
         clearInterval(state.adapterTimer);
@@ -1506,13 +1513,18 @@ function pollAdapterJob(jobId) {
         setExportEnabled(true);
       }
     } catch (error) {
-      clearInterval(state.adapterTimer);
-      state.adapterTimer = null;
-      setActivity(`Film adapter polling failed: ${error.message}`, 0);
-      state.adapterInFlight = false;
-      state.currentAdapterJobId = null;
-      saveLocalState();
-      setExportEnabled(true);
+      if (error.status === 404) {
+        clearInterval(state.adapterTimer);
+        state.adapterTimer = null;
+        setActivity("Film adapter job is no longer available", 0);
+        state.adapterInFlight = false;
+        state.currentAdapterJobId = null;
+        saveLocalState();
+        setExportEnabled(true);
+        return;
+      }
+      state.adapterPollFailures += 1;
+      setActivity(`Film adapter polling interrupted (${state.adapterPollFailures}). Retrying: ${error.message}`);
     }
   }, 1200);
 }
@@ -1522,6 +1534,7 @@ function pollJob(jobId) {
   state.jobTimer = setInterval(async () => {
     try {
       const job = await api(`/api/jobs/${jobId}`);
+      state.jobPollFailures = 0;
       await fetchFrameEvents(jobId);
       updateJobUi(job);
       if (job.status === "done") {
@@ -1546,13 +1559,18 @@ function pollJob(jobId) {
         setExportEnabled(true);
       }
     } catch (error) {
-      clearInterval(state.jobTimer);
-      state.jobTimer = null;
-      setActivity(`Job polling failed: ${error.message}`, 0);
-      state.exportInFlight = false;
-      state.currentJobId = null;
-      saveLocalState();
-      setExportEnabled(true);
+      if (error.status === 404) {
+        clearInterval(state.jobTimer);
+        state.jobTimer = null;
+        setActivity("Export job is no longer available", 0);
+        state.exportInFlight = false;
+        state.currentJobId = null;
+        saveLocalState();
+        setExportEnabled(true);
+        return;
+      }
+      state.jobPollFailures += 1;
+      setActivity(`Job polling interrupted (${state.jobPollFailures}). Retrying: ${error.message}`);
     }
   }, 700);
 }
