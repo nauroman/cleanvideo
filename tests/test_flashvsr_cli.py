@@ -120,6 +120,42 @@ class FakePipelineModule:
 
 
 class FlashVsrCliTests(unittest.TestCase):
+    def test_extends_temporal_rope_for_long_streaming_runs(self) -> None:
+        flashvsr_cli = load_flashvsr_cli()
+
+        class FakeDit:
+            def __init__(self) -> None:
+                self.freqs = (
+                    torch.zeros((1024, 22), dtype=torch.complex64),
+                    torch.ones((1024, 21), dtype=torch.complex64),
+                    torch.full((1024, 21), 2, dtype=torch.complex64),
+                )
+
+        def fake_precompute(dim: int, end: int):
+            self.assertEqual(dim, 44)
+            return torch.full((end, dim // 2), 3, dtype=torch.complex64)
+
+        dit = FakeDit()
+        fake_model_module = SimpleNamespace(precompute_freqs_cis=fake_precompute)
+        with patch.object(flashvsr_cli.importlib, "import_module", return_value=fake_model_module):
+            flashvsr_cli.ensure_temporal_rope_capacity(dit, 1430)
+
+        self.assertEqual(dit.freqs[0].shape, (1430, 22))
+        self.assertTrue(torch.all(dit.freqs[0] == 3))
+        self.assertEqual(dit.freqs[1].shape, (1024, 21))
+        self.assertEqual(dit.freqs[2].shape, (1024, 21))
+
+    def test_keeps_temporal_rope_when_capacity_is_sufficient(self) -> None:
+        flashvsr_cli = load_flashvsr_cli()
+        original = torch.zeros((1024, 22), dtype=torch.complex64)
+        dit = SimpleNamespace(freqs=(original, object(), object()))
+
+        with patch.object(flashvsr_cli.importlib, "import_module") as import_module:
+            flashvsr_cli.ensure_temporal_rope_capacity(dit, 512)
+
+        import_module.assert_not_called()
+        self.assertIs(dit.freqs[0], original)
+
     def test_streaming_render_uses_wrapped_modules_without_full_dit_shuttling(self) -> None:
         flashvsr_cli = load_flashvsr_cli()
         pipe = FakePipe()

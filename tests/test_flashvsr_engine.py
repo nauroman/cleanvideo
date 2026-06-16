@@ -46,6 +46,17 @@ class FlashVsrEngineTests(unittest.TestCase):
 
         self.assertTrue(is_transient_import_corruption(detail))
 
+    def test_detects_python_re_compiler_import_corruption(self) -> None:
+        detail = """
+        File "/home/user/.cleanvideo/flashvsr-wsl/.venv/lib/python3.11/site-packages/urllib3/util/url.py", line 59, in <module>
+          _IPV6_RE = re.compile("^" + _IPV6_PAT + "$")
+        File "/home/user/.local/share/uv/python/cpython-3.11.15-linux-x86_64-gnu/lib/python3.11/re/_compiler.py", line 176, in _compile
+          _compile(code, av, flags)
+        TypeError: unsupported operand type(s) for +: 'int' and 'Tokenizer'
+        """
+
+        self.assertTrue(is_transient_import_corruption(detail))
+
     def test_does_not_mask_regular_flashvsr_failures(self) -> None:
         detail = "RuntimeError: CUDA out of memory while running FlashVSR"
 

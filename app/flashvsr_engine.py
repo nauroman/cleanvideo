@@ -42,9 +42,12 @@ def is_cuda_out_of_memory(output: str) -> bool:
 def is_transient_import_corruption(output: str) -> bool:
     normalized = output.replace("\\", "/")
     return (
-        "TypeError: unsupported operand type(s) for +:" in normalized
-        and "Tokenizer" in normalized
-        and "re/_parser.py" in normalized
+        (
+            "TypeError: unsupported operand type(s) for +:" in normalized
+            and "Tokenizer" in normalized
+            and "re/_parser.py" in normalized
+        )
+        or ("TypeError:" in normalized and "re/_compiler.py" in normalized)
     )
 
 

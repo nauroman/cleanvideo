@@ -309,6 +309,32 @@ def pipeline_module(pipe):
     return importlib.import_module(pipe.__class__.__module__)
 
 
+def ensure_temporal_rope_capacity(dit, required_positions: int) -> None:
+    freqs = getattr(dit, "freqs", None)
+    if not freqs or len(freqs) < 3:
+        return
+
+    temporal_freqs = freqs[0]
+    if temporal_freqs.shape[0] >= required_positions:
+        return
+
+    model_module = importlib.import_module(dit.__class__.__module__)
+    precompute = getattr(model_module, "precompute_freqs_cis", None)
+    if precompute is None:
+        raise RuntimeError("Could not extend FlashVSR temporal RoPE frequencies.")
+
+    temporal_dim = int(temporal_freqs.shape[-1]) * 2
+    extended = precompute(temporal_dim, end=required_positions).to(device=temporal_freqs.device)
+    if extended.dtype != temporal_freqs.dtype:
+        extended = extended.to(dtype=temporal_freqs.dtype)
+
+    dit.freqs = (extended, freqs[1], freqs[2])
+    print(
+        f"Extended FlashVSR temporal RoPE positions: {temporal_freqs.shape[0]} -> {required_positions}",
+        flush=True,
+    )
+
+
 def stream_flashvsr_tiny(module, pipe, args) -> None:
     source = StreamingLqFrameBuffer(
         module,
@@ -338,6 +364,8 @@ def stream_flashvsr_tiny(module, pipe, args) -> None:
     process_total_num = (source.model_frames - 1) // 8 - 2
     if process_total_num <= 0:
         raise RuntimeError(f"FlashVSR streaming needs at least one process step, got {process_total_num}.")
+    required_temporal_positions = max(6, 4 + max(0, process_total_num - 1) * 2 + 2)
+    ensure_temporal_rope_capacity(pipe.dit, required_temporal_positions)
 
     pre_cache_k = None
     pre_cache_v = None
