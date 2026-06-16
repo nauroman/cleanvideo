@@ -118,6 +118,41 @@ def h264_nvenc_available() -> bool:
     return "h264_nvenc" in proc.stdout
 
 
+def h264_video_args(encoder: str, crf: int, *, nvenc_preset: str = "p5", x264_preset: str = "slow") -> tuple[str, list[str]]:
+    selected = encoder
+    if selected == "auto":
+        selected = "h264_nvenc" if h264_nvenc_available() else "libx264"
+
+    if selected == "h264_nvenc":
+        return selected, [
+            "-c:v",
+            "h264_nvenc",
+            "-preset",
+            nvenc_preset,
+            "-tune",
+            "hq",
+            "-rc",
+            "vbr",
+            "-cq",
+            str(crf),
+            "-b:v",
+            "0",
+            "-pix_fmt",
+            "yuv420p",
+        ]
+
+    return "libx264", [
+        "-c:v",
+        "libx264",
+        "-preset",
+        x264_preset,
+        "-crf",
+        str(crf),
+        "-pix_fmt",
+        "yuv420p",
+    ]
+
+
 def encode_video(
     frames_dir: Path,
     source_video: Path,
@@ -128,10 +163,6 @@ def encode_video(
     frame_count: int | None = None,
 ) -> str:
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    selected = encoder
-    if selected == "auto":
-        selected = "h264_nvenc" if h264_nvenc_available() else "libx264"
-
     base_args = [
         "ffmpeg",
         "-y",
@@ -153,35 +184,7 @@ def encode_video(
     if frame_count is not None:
         tail_args = ["-frames:v", str(frame_count)] + tail_args
 
-    if selected == "h264_nvenc":
-        video_args = [
-            "-c:v",
-            "h264_nvenc",
-            "-preset",
-            "p5",
-            "-tune",
-            "hq",
-            "-rc",
-            "vbr",
-            "-cq",
-            str(crf),
-            "-b:v",
-            "0",
-            "-pix_fmt",
-            "yuv420p",
-        ]
-    else:
-        selected = "libx264"
-        video_args = [
-            "-c:v",
-            "libx264",
-            "-preset",
-            "slow",
-            "-crf",
-            str(crf),
-            "-pix_fmt",
-            "yuv420p",
-        ]
+    selected, video_args = h264_video_args(encoder, crf)
 
     try:
         run_process(base_args + video_args + tail_args)
@@ -203,3 +206,191 @@ def encode_video(
         else:
             raise
     return selected
+
+
+def create_video_chunk(
+    video_path: Path,
+    output_path: Path,
+    start_frame: int,
+    frame_count: int,
+    fps: float,
+    longest_side_cap: int | None = None,
+    min_frame_count: int | None = None,
+) -> dict:
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    start_seconds = max(0.0, start_frame / max(1.0, fps))
+    args = [
+        "ffmpeg",
+        "-y",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-ss",
+        f"{start_seconds:.6f}",
+        "-i",
+        str(video_path),
+        "-map",
+        "0:v:0",
+    ]
+    filters = []
+    if longest_side_cap is not None and longest_side_cap > 0:
+        safe_longest = max(256, int(longest_side_cap))
+        filters.append(
+            f"scale=w=min({safe_longest}\\,iw):h=min({safe_longest}\\,ih):"
+            "force_original_aspect_ratio=decrease:force_divisible_by=2"
+        )
+    output_frame_count = max(1, frame_count)
+    if min_frame_count is not None and min_frame_count > output_frame_count:
+        pad_duration = (min_frame_count - output_frame_count + 1) / max(1.0, fps)
+        filters.append(f"tpad=stop_mode=clone:stop_duration={pad_duration:.6f}")
+        output_frame_count = min_frame_count
+    if filters:
+        args.extend(["-vf", ",".join(filters)])
+    args.extend(
+        [
+            "-an",
+            "-frames:v",
+            str(output_frame_count),
+            "-c:v",
+            "libx264",
+            "-preset",
+            "veryfast",
+            "-crf",
+            "10",
+            "-pix_fmt",
+            "yuv420p",
+            str(output_path),
+        ]
+    )
+    run_process(args)
+    return probe_video(output_path)
+
+
+def trim_video_frame_count(input_path: Path, output_path: Path, frame_count: int) -> None:
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    args = [
+        "ffmpeg",
+        "-y",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-i",
+        str(input_path),
+        "-map",
+        "0:v:0",
+        "-an",
+        "-frames:v",
+        str(max(1, frame_count)),
+        "-c",
+        "copy",
+        str(output_path),
+    ]
+    try:
+        run_process(args)
+    except subprocess.CalledProcessError:
+        run_process(
+            [
+                "ffmpeg",
+                "-y",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-i",
+                str(input_path),
+                "-map",
+                "0:v:0",
+                "-an",
+                "-frames:v",
+                str(max(1, frame_count)),
+                "-c:v",
+                "libx264",
+                "-preset",
+                "veryfast",
+                "-crf",
+                "10",
+                "-pix_fmt",
+                "yuv420p",
+                str(output_path),
+            ]
+        )
+
+
+def concat_videos_copy(video_paths: list[Path], output_path: Path) -> None:
+    if not video_paths:
+        raise RuntimeError("No video chunks to concatenate.")
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    list_path = output_path.parent / f"{output_path.stem}_concat.txt"
+    lines = []
+    for path in video_paths:
+        relative = path.resolve().as_posix()
+        escaped = relative.replace("'", "'\\''")
+        lines.append(f"file '{escaped}'")
+    list_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    run_process(
+        [
+            "ffmpeg",
+            "-y",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-f",
+            "concat",
+            "-safe",
+            "0",
+            "-i",
+            str(list_path),
+            "-c",
+            "copy",
+            "-movflags",
+            "+faststart",
+            str(output_path),
+        ]
+    )
+
+
+def remux_video_with_source_audio(
+    processed_video: Path,
+    source_video: Path,
+    output_path: Path,
+) -> str:
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    args = [
+        "ffmpeg",
+        "-y",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-i",
+        str(processed_video),
+        "-i",
+        str(source_video),
+        "-map",
+        "0:v:0",
+        "-map",
+        "1:a?",
+        "-c:v",
+        "copy",
+        "-c:a",
+        "copy",
+        "-shortest",
+        "-movflags",
+        "+faststart",
+        str(output_path),
+    ]
+    try:
+        run_process(args)
+        return "video copy, audio copy"
+    except subprocess.CalledProcessError:
+        output_path.unlink(missing_ok=True)
+        fallback = args[:-6] + [
+            "-c:a",
+            "aac",
+            "-b:a",
+            "192k",
+            "-shortest",
+            "-movflags",
+            "+faststart",
+            str(output_path),
+        ]
+        run_process(fallback)
+        return "video copy, audio aac"

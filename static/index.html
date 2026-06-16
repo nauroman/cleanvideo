@@ -4,7 +4,7 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>CleanVideo</title>
-    <link rel="stylesheet" href="/styles.css?v=2026-06-12-partial-export-v4" />
+    <link rel="stylesheet" href="/styles.css?v=2026-06-15-seedvr2-flashvsr-wsl-v15" />
   </head>
   <body>
     <main class="app-shell">
@@ -19,9 +19,20 @@
 
         <section class="rail-section">
           <h2>Engine</h2>
-          <button class="engine-card selected" type="button">
+          <button class="engine-card selected" type="button" data-engine="flashvsr">
+            <span>FlashVSR</span>
+            <small>v1.1 official</small>
+            <small class="engine-speed" data-engine-speed="flashvsr">Speed: --</small>
+          </button>
+          <button class="engine-card" type="button" data-engine="seedvr2">
+            <span>SeedVR2</span>
+            <small>Video-native</small>
+            <small class="engine-speed" data-engine-speed="seedvr2">Speed: --</small>
+          </button>
+          <button class="engine-card" type="button" data-engine="hypir">
             <span>HYPIR</span>
             <small>SD2 local CUDA</small>
+            <small class="engine-speed" data-engine-speed="hypir">Speed: --</small>
           </button>
           <button class="engine-card disabled" type="button" aria-disabled="true">
             <span>SUPIR</span>
@@ -45,7 +56,7 @@
           </div>
         </section>
 
-        <section class="rail-section film-adapter-rail">
+        <section class="rail-section film-adapter-rail" data-engine-field="hypir">
           <h2>Film Adapter</h2>
           <div class="field">
             <span class="field-label">
@@ -143,25 +154,31 @@
         </header>
 
         <section class="viewer-grid">
-          <article class="viewer-pane">
+          <article class="viewer-pane comparison-pane">
             <div class="pane-head">
-              <span>Original</span>
-              <small id="originalInfo">source frame</small>
+              <span>Preview</span>
+              <small>
+                <span id="originalInfo">source frame</span>
+                <span class="pane-head-divider">|</span>
+                <span id="enhancedInfo">HYPIR preview</span>
+              </small>
             </div>
-            <div class="media-box">
+            <div id="comparisonBox" class="media-box comparison-box">
               <video id="sourceVideo" controls muted playsinline hidden></video>
-              <img id="originalPreview" alt="Original preview frame" hidden />
+              <img id="originalPreview" class="comparison-image comparison-before" alt="Original preview frame" hidden />
+              <div id="comparisonAfterClip" class="comparison-after-clip" hidden>
+                <img id="enhancedPreview" class="comparison-image comparison-after" alt="Enhanced preview frame" hidden />
+              </div>
+              <div id="comparisonDivider" class="comparison-divider" hidden></div>
+              <button
+                id="comparisonHandle"
+                class="comparison-handle"
+                type="button"
+                aria-label="Drag before-after divider"
+                title="Drag before-after divider"
+                hidden
+              ></button>
               <div id="originalEmpty" class="empty-state">Upload video</div>
-            </div>
-          </article>
-
-          <article class="viewer-pane">
-            <div class="pane-head">
-              <span>Enhanced</span>
-              <small id="enhancedInfo">HYPIR preview</small>
-            </div>
-            <div class="media-box">
-              <img id="enhancedPreview" alt="Enhanced preview frame" hidden />
               <div id="enhancedEmpty" class="empty-state">Preview frame</div>
             </div>
           </article>
@@ -177,6 +194,28 @@
             <button id="exportButton" class="secondary-button" type="button" disabled>
               <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3v12M7 10l5 5 5-5M5 21h14"/></svg>
               Render Video
+            </button>
+            <button
+              id="previewButton"
+              class="secondary-button"
+              type="button"
+              title="Run a capped preview for the current frame"
+              disabled
+              hidden
+            >
+              <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 12h14M12 5l7 7-7 7"/></svg>
+              Preview Frame
+            </button>
+            <button
+              id="playReadyButton"
+              class="secondary-button"
+              type="button"
+              title="Play generated PNG frames in the preview window"
+              disabled
+              hidden
+            >
+              <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M8 5v14l11-7z"/></svg>
+              <span id="playReadyLabel">Play Ready</span>
             </button>
             <button id="cancelExportButton" class="danger-button" type="button" hidden>
               <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 6l12 12M18 6 6 18"/></svg>
@@ -246,7 +285,7 @@
                 class="help-button"
                 type="button"
                 aria-label="Upscale help"
-                data-tooltip="Sets the frame size before HYPIR. 0.5x halves width and height with high-quality Lanczos downscaling before enhancement, 1x keeps the same resolution, and 2x or 4x make each frame larger. Higher values take much longer and use more VRAM."
+                data-tooltip="Sets the output size. HYPIR uses this per frame; SeedVR2 maps it to target video resolution; FlashVSR is optimized for 4x and clamps lower custom choices to at least 1x."
               >?</button>
             </span>
             <select id="upscale" aria-label="Upscale">
@@ -272,8 +311,8 @@
         </section>
 
         <section class="panel">
-          <h2>HYPIR Quality</h2>
-          <div class="field">
+          <h2>Engine Quality</h2>
+          <div class="field" data-engine-field="hypir">
             <span class="field-label">
               Patch Size
               <button
@@ -289,7 +328,7 @@
               <option value="1024">1024</option>
             </select>
           </div>
-          <div class="field">
+          <div class="field" data-engine-field="hypir">
             <span class="field-label">
               Stride
               <button
@@ -306,7 +345,7 @@
               <option value="768">768</option>
             </select>
           </div>
-          <div class="field">
+          <div class="field" data-engine-field="hypir">
             <span class="field-label">
               Temporal
               <button
@@ -336,7 +375,7 @@
             </span>
             <input id="seed" type="number" value="231" aria-label="Seed" />
           </div>
-          <div class="field">
+          <div class="field" data-engine-field="hypir">
             <span class="field-label">
               Prompt
               <button
@@ -347,6 +386,161 @@
               >?</button>
             </span>
             <textarea id="prompt" rows="4" spellcheck="false" aria-label="Prompt">high quality, sharp details, natural texture</textarea>
+          </div>
+          <div class="field" data-engine-field="seedvr2">
+            <span class="field-label">
+              Batch Size
+              <button
+                class="help-button"
+                type="button"
+                aria-label="SeedVR2 Batch Size help"
+                data-tooltip="Frames per SeedVR2 batch. Larger values improve temporal consistency and speed but use much more VRAM. Must follow 4n+1: 1, 5, 9, 13, 17, 21. Use smaller values for 4K."
+              >?</button>
+            </span>
+            <select id="seedvr2BatchSize" aria-label="SeedVR2 Batch Size">
+              <option value="1">1</option>
+              <option value="5">5</option>
+              <option value="9">9</option>
+              <option value="13">13</option>
+              <option value="17" selected>17</option>
+              <option value="21">21</option>
+              <option value="25">25</option>
+            </select>
+          </div>
+          <div class="field" data-engine-field="seedvr2">
+            <span class="field-label">
+              Temporal Overlap
+              <button
+                class="help-button"
+                type="button"
+                aria-label="SeedVR2 Temporal Overlap help"
+                data-tooltip="Frames blended between SeedVR2 batches or chunks. 3 is a good default; higher can smooth transitions but repeats more work."
+              >?</button>
+            </span>
+            <select id="seedvr2TemporalOverlap" aria-label="SeedVR2 Temporal Overlap">
+              <option value="0">0</option>
+              <option value="1">1</option>
+              <option value="2">2</option>
+              <option value="3" selected>3</option>
+              <option value="4">4</option>
+              <option value="5">5</option>
+            </select>
+          </div>
+          <div class="field" data-engine-field="seedvr2">
+            <span class="field-label">
+              Chunk Size
+              <button
+                class="help-button"
+                type="button"
+                aria-label="SeedVR2 Chunk Size help"
+                data-tooltip="Frames per streaming chunk for long SeedVR2 exports. 170 keeps memory bounded. 0 processes the whole video at once and can use much more RAM."
+              >?</button>
+            </span>
+            <select id="seedvr2ChunkSize" aria-label="SeedVR2 Chunk Size">
+              <option value="0">0</option>
+              <option value="85">85</option>
+              <option value="170" selected>170</option>
+              <option value="340">340</option>
+            </select>
+          </div>
+          <div class="field" data-engine-field="seedvr2">
+            <span class="field-label">
+              Color Correction
+              <button
+                class="help-button"
+                type="button"
+                aria-label="SeedVR2 Color Correction help"
+                data-tooltip="Color matching method after SeedVR2 generation. Lab is the current balanced default. None preserves model output without correction."
+              >?</button>
+            </span>
+            <select id="seedvr2ColorCorrection" aria-label="SeedVR2 Color Correction">
+              <option value="lab" selected>Lab</option>
+              <option value="wavelet">Wavelet</option>
+              <option value="wavelet_adaptive">Wavelet Adaptive</option>
+              <option value="hsv">HSV</option>
+              <option value="adain">AdaIN</option>
+              <option value="none">None</option>
+            </select>
+          </div>
+          <div class="field" data-engine-field="seedvr2">
+            <span class="field-label">
+              Preview Size
+              <button
+                class="help-button"
+                type="button"
+                aria-label="SeedVR2 Preview Size help"
+                data-tooltip="Manual preview output size. Safe keeps the UI responsive. 4K is available, but it is intentionally manual and cancels older previews before starting."
+              >?</button>
+            </span>
+            <select id="seedvr2PreviewSize" aria-label="SeedVR2 Preview Size">
+              <option value="640">640</option>
+              <option value="1280" selected>Safe 1280</option>
+              <option value="1920">Full HD</option>
+              <option value="3840">4K</option>
+            </select>
+          </div>
+          <div class="field" data-engine-field="flashvsr">
+            <span class="field-label">
+              Variant
+              <button
+                class="help-button"
+                type="button"
+                aria-label="FlashVSR Variant help"
+                data-tooltip="FlashVSR model script. Tiny Long is the current default for video. Tiny can be faster on short clips. Full is heavier and may exceed VRAM at high resolution."
+              >?</button>
+            </span>
+            <select id="flashvsrVariant" aria-label="FlashVSR Variant">
+              <option value="tiny_long" selected>Tiny Long</option>
+              <option value="tiny">Tiny</option>
+              <option value="full">Full</option>
+            </select>
+          </div>
+          <div class="field" data-engine-field="flashvsr">
+            <span class="field-label">
+              Sparse Ratio
+              <button
+                class="help-button"
+                type="button"
+                aria-label="FlashVSR Sparse Ratio help"
+                data-tooltip="Locality-constrained sparse attention ratio. 2.0 is the stable default; 1.5 can be faster but may reduce consistency."
+              >?</button>
+            </span>
+            <select id="flashvsrSparseRatio" aria-label="FlashVSR Sparse Ratio">
+              <option value="1.5">1.5</option>
+              <option value="2" selected>2.0</option>
+            </select>
+          </div>
+          <div class="field" data-engine-field="flashvsr">
+            <span class="field-label">
+              Local Range
+              <button
+                class="help-button"
+                type="button"
+                aria-label="FlashVSR Local Range help"
+                data-tooltip="Temporal/local attention range. 9 can be sharper; 11 is usually more stable."
+              >?</button>
+            </span>
+            <select id="flashvsrLocalRange" aria-label="FlashVSR Local Range">
+              <option value="9">9</option>
+              <option value="11" selected>11</option>
+            </select>
+          </div>
+          <div class="field" data-engine-field="flashvsr">
+            <span class="field-label">
+              Preview Size
+              <button
+                class="help-button"
+                type="button"
+                aria-label="FlashVSR Preview Size help"
+                data-tooltip="Manual FlashVSR preview output size. The backend cuts a short clip around the current frame and cancels older previews. 4K is available but can still be slow."
+              >?</button>
+            </span>
+            <select id="flashvsrPreviewCap" aria-label="FlashVSR Preview Size">
+              <option value="640">640</option>
+              <option value="1280" selected>Safe 1280</option>
+              <option value="1920">Full HD</option>
+              <option value="3840">4K</option>
+            </select>
           </div>
         </section>
 
@@ -384,6 +578,6 @@
         </section>
       </aside>
     </main>
-    <script src="/app.js?v=2026-06-12-partial-export-v4" type="module"></script>
+    <script src="/app.js?v=2026-06-15-seedvr2-flashvsr-wsl-v15" type="module"></script>
   </body>
 </html>

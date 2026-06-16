@@ -10,8 +10,8 @@ import subprocess
 import sys
 import threading
 import time
-import traceback
 import uuid
+from dataclasses import replace
 from datetime import datetime
 from pathlib import Path
 from typing import Literal
@@ -27,15 +27,21 @@ from .film_adapter import (
     cleanup_adapter_training_artifacts,
     set_train_config_resume_checkpoint,
 )
+from .flashvsr_engine import FlashVsrSettings, engine as flashvsr_engine
 from .hypir_engine import HypirSettings, engine
+from .seedvr2_engine import SeedVr2Settings, engine as seedvr2_engine
 from .temporal_stabilizer import TemporalConsistency, stabilize_frame, temporal_mode_enabled
 from .video_ops import (
+    concat_videos_copy,
+    create_video_chunk,
     encode_video,
     extract_frame,
     extract_frames,
     h264_nvenc_available,
     probe_video,
+    remux_video_with_source_audio,
     safe_name,
+    trim_video_frame_count,
 )
 
 
@@ -53,11 +59,26 @@ ADAPTER_DIR = WORK_DIR / "adapters"
 for directory in [UPLOAD_DIR, PREVIEW_DIR, EXPORT_DIR, JOB_DIR, CACHE_DIR, PARTIAL_DIR, ADAPTER_DIR]:
     directory.mkdir(parents=True, exist_ok=True)
 GENERATED_DIRS = [PREVIEW_DIR, CACHE_DIR, PARTIAL_DIR, JOB_DIR, EXPORT_DIR]
-APP_BUILD = "2026-06-12-adapter-recovery-v1"
+APP_BUILD = "2026-06-15-seedvr2-flashvsr-wsl-v15"
 ADAPTER_TRAINING_RECOVERY_LIMIT = 3
+SEEDVR2_PREVIEW_DEFAULT_LONGEST_SIDE = 1280
+FLASHVSR_PREVIEW_DEFAULT_LONGEST_SIDE = 1280
+FLASHVSR_PREVIEW_FRAMES = 21
+FLASHVSR_PREVIEW_SAFE_MODEL_LONGEST_SIDE = 1920
+FLASHVSR_PREVIEW_TIMEOUT_SECONDS = 5 * 60
+FLASHVSR_EXPORT_CHUNK_FRAMES = 21
+FLASHVSR_NATIVE_MIN_LONGEST_SIDE = 512
+EngineName = Literal["hypir", "seedvr2", "flashvsr"]
+ENGINE_VERSION = {
+    "hypir": "hypir-sd2-v1",
+    "seedvr2": "seedvr2-3b-fp8-cli-v1",
+    "flashvsr": "flashvsr-v1.1-official",
+}
 
 AdapterQuality = Literal["fast", "high", "extra"]
 SecondPassMode = Literal["off", "base_after_adapter"]
+SeedVr2ColorCorrection = Literal["lab", "wavelet", "wavelet_adaptive", "hsv", "adain", "none"]
+FlashVsrVariant = Literal["tiny_long", "tiny", "full"]
 ADAPTER_QUALITY_PRESETS: dict[str, dict[str, float]] = {
     "fast": {
         "minFrames": 64,
@@ -93,7 +114,7 @@ ADAPTER_QUALITY_PRESETS: dict[str, dict[str, float]] = {
 
 
 class ProcessSettings(BaseModel):
-    engine: Literal["hypir"] = "hypir"
+    engine: EngineName = "hypir"
     prompt: str = ""
     scaleBy: Literal["factor", "longest_side"] = "factor"
     upscale: float = Field(default=1, ge=0.5, le=8)
@@ -105,6 +126,15 @@ class ProcessSettings(BaseModel):
     adapterId: str = "base"
     secondPass: SecondPassMode = "off"
     device: Literal["cuda"] = "cuda"
+    seedvr2BatchSize: int = Field(default=17, ge=1, le=81)
+    seedvr2TemporalOverlap: int = Field(default=3, ge=0, le=16)
+    seedvr2ChunkSize: int = Field(default=170, ge=0, le=10000)
+    seedvr2ColorCorrection: SeedVr2ColorCorrection = "lab"
+    seedvr2PreviewSize: int = Field(default=SEEDVR2_PREVIEW_DEFAULT_LONGEST_SIDE, ge=640, le=3840)
+    flashvsrVariant: FlashVsrVariant = "tiny_long"
+    flashvsrSparseRatio: float = Field(default=2.0, ge=0.5, le=4.0)
+    flashvsrLocalRange: int = Field(default=11, ge=1, le=31)
+    flashvsrPreviewCap: int = Field(default=FLASHVSR_PREVIEW_DEFAULT_LONGEST_SIDE, ge=512, le=3840)
 
     def to_hypir(self, adapter_weight_path: Path | None = None) -> HypirSettings:
         return HypirSettings(
@@ -130,6 +160,54 @@ class ProcessSettings(BaseModel):
             seed=self.seed,
             device=self.device,
             weight_path=None,
+        )
+
+    def to_seedvr2(self) -> SeedVr2Settings:
+        return SeedVr2Settings(
+            scale_by=self.scaleBy,
+            upscale=self.upscale,
+            target_longest_side=self.targetLongestSide,
+            seed=self.seed,
+            device=self.device,
+            batch_size=self.seedvr2BatchSize,
+            temporal_overlap=self.seedvr2TemporalOverlap,
+            color_correction=self.seedvr2ColorCorrection,
+            chunk_size=self.seedvr2ChunkSize,
+        )
+
+    def to_seedvr2_preview(self) -> SeedVr2Settings:
+        return SeedVr2Settings(
+            scale_by="longest_side",
+            upscale=1,
+            target_longest_side=self.seedvr2PreviewSize,
+            seed=self.seed,
+            device=self.device,
+            batch_size=1,
+            temporal_overlap=self.seedvr2TemporalOverlap,
+            color_correction=self.seedvr2ColorCorrection,
+            chunk_size=0,
+        )
+
+    def to_flashvsr(self) -> FlashVsrSettings:
+        return FlashVsrSettings(
+            scale_by=self.scaleBy,
+            upscale=self.upscale,
+            target_longest_side=self.targetLongestSide,
+            seed=self.seed,
+            variant=self.flashvsrVariant,
+            sparse_ratio=self.flashvsrSparseRatio,
+            local_range=self.flashvsrLocalRange,
+        )
+
+    def to_flashvsr_preview(self) -> FlashVsrSettings:
+        return FlashVsrSettings(
+            scale_by="longest_side",
+            upscale=1,
+            target_longest_side=self.flashvsrPreviewCap,
+            seed=self.seed,
+            variant=self.flashvsrVariant,
+            sparse_ratio=self.flashvsrSparseRatio,
+            local_range=self.flashvsrLocalRange,
         )
 
 
@@ -164,6 +242,7 @@ class JobState(BaseModel):
     status: Literal["queued", "running", "done", "error", "cancelled"]
     progress: float
     message: str
+    engine: EngineName | None = None
     videoId: str | None = None
     etaSeconds: float | None = None
     framesDone: int = 0
@@ -177,6 +256,9 @@ class JobState(BaseModel):
     cacheKey: str | None = None
     cacheHits: int = 0
     cacheMisses: int = 0
+    averageFrameSeconds: float | None = None
+    metricResolution: str | None = None
+    metricSource: str | None = None
     outputUrl: str | None = None
     outputPath: str | None = None
     adapterId: str | None = None
@@ -214,10 +296,90 @@ jobs_lock = threading.Lock()
 cancelled_jobs: set[str] = set()
 partial_exports_active: set[str] = set()
 job_processes: dict[str, subprocess.Popen] = {}
+preview_lock = threading.Lock()
+preview_generation = 0
+cancelled_previews: set[int] = set()
+preview_processes: dict[int, subprocess.Popen] = {}
 
 
 def now_iso() -> str:
     return datetime.now().isoformat(timespec="seconds")
+
+
+def user_facing_error(exc: Exception, limit: int = 1600) -> str:
+    message = str(exc).strip() or exc.__class__.__name__
+    message = " ".join(message.split())
+    if len(message) <= limit:
+        return message
+    return f"{message[: limit - 1].rstrip()}…"
+
+
+def terminate_process(process: subprocess.Popen, timeout: float = 5.0) -> None:
+    if process.poll() is not None:
+        return
+    try:
+        process.terminate()
+        process.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        try:
+            process.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            pass
+    except Exception:
+        pass
+
+
+def start_preview_run() -> int:
+    global preview_generation
+    with preview_lock:
+        preview_generation += 1
+        token = preview_generation
+        stale = list(preview_processes.items())
+        for stale_token, _process in stale:
+            cancelled_previews.add(stale_token)
+        preview_processes.clear()
+
+    for _stale_token, process in stale:
+        terminate_process(process)
+    return token
+
+
+def cancel_preview_runs() -> int:
+    global preview_generation
+    with preview_lock:
+        preview_generation += 1
+        stale = list(preview_processes.items())
+        for stale_token, _process in stale:
+            cancelled_previews.add(stale_token)
+        preview_processes.clear()
+
+    for _stale_token, process in stale:
+        terminate_process(process)
+    return len(stale)
+
+
+def register_preview_process(token: int, process: subprocess.Popen) -> None:
+    should_terminate = False
+    with preview_lock:
+        if token != preview_generation or token in cancelled_previews:
+            should_terminate = True
+        else:
+            preview_processes[token] = process
+    if should_terminate:
+        terminate_process(process)
+        raise RuntimeError("Preview cancelled by a newer request")
+
+
+def preview_should_cancel(token: int) -> bool:
+    with preview_lock:
+        return token != preview_generation or token in cancelled_previews
+
+
+def finish_preview_run(token: int) -> None:
+    with preview_lock:
+        preview_processes.pop(token, None)
+        cancelled_previews.discard(token)
 
 
 def video_meta_path(video_id: str) -> Path:
@@ -452,6 +614,115 @@ def valid_image(path: Path) -> bool:
         return False
 
 
+def image_resolution_label(path: Path) -> str | None:
+    try:
+        with Image.open(path) as img:
+            return f"{img.width}x{img.height}"
+    except Exception:
+        return None
+
+
+def create_short_preview_clip(
+    video_path: Path,
+    output_path: Path,
+    center_seconds: float,
+    longest_side: int,
+    max_frames: int = FLASHVSR_PREVIEW_FRAMES,
+) -> tuple[int, int, float, float]:
+    metadata = probe_video(video_path)
+    fps = max(1.0, float(metadata.get("fps") or 30.0))
+    source_duration = max(0.0, float(metadata.get("duration") or 0.0))
+    clip_duration = max(1.0 / fps, max_frames / fps)
+    if source_duration > 0:
+        clip_duration = min(clip_duration, source_duration)
+        start_seconds = min(max(0.0, center_seconds - clip_duration / 2), max(0.0, source_duration - clip_duration))
+    else:
+        start_seconds = max(0.0, center_seconds - clip_duration / 2)
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    safe_longest_side = max(256, min(3840, int(longest_side)))
+    scale_filter = (
+        f"scale=w=min({safe_longest_side}\\,iw):h=min({safe_longest_side}\\,ih):"
+        "force_original_aspect_ratio=decrease:force_divisible_by=2"
+    )
+    video_filter = f"{scale_filter},tpad=stop_mode=clone:stop_duration={clip_duration:.3f}"
+    subprocess.run(
+        [
+            "ffmpeg",
+            "-y",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-ss",
+            f"{start_seconds:.3f}",
+            "-i",
+            str(video_path),
+            "-map",
+            "0:v:0",
+            "-vf",
+            video_filter,
+            "-an",
+            "-frames:v",
+            str(max_frames),
+            "-c:v",
+            "libx264",
+            "-preset",
+            "veryfast",
+            "-crf",
+            "16",
+            "-pix_fmt",
+            "yuv420p",
+            str(output_path),
+        ],
+        text=True,
+        capture_output=True,
+        check=True,
+    )
+    clip_metadata = probe_video(output_path)
+    actual_duration = float(clip_metadata.get("duration") or clip_duration)
+    return (
+        int(clip_metadata.get("width") or 0),
+        int(clip_metadata.get("height") or 0),
+        start_seconds,
+        actual_duration,
+    )
+
+
+def create_capped_preview_source(image_path: Path, output_path: Path, longest_side: int) -> tuple[int, int]:
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    with Image.open(image_path).convert("RGB") as img:
+        longest = max(img.size)
+        if longest > longest_side:
+            ratio = longest_side / longest
+            size = (
+                max(1, int(round(img.width * ratio))),
+                max(1, int(round(img.height * ratio))),
+            )
+            img = img.resize(size, Image.Resampling.LANCZOS)
+        img.save(output_path)
+        return img.width, img.height
+
+
+def create_seedvr2_preview_source(image_path: Path, output_path: Path, longest_side: int) -> tuple[int, int]:
+    return create_capped_preview_source(image_path, output_path, longest_side)
+
+
+def upscale_image_to_longest_side(image_path: Path, longest_side: int) -> tuple[int, int]:
+    with Image.open(image_path).convert("RGB") as img:
+        longest = max(img.size)
+        if longest <= 0 or longest == longest_side:
+            img.save(image_path)
+            return img.width, img.height
+        ratio = longest_side / longest
+        size = (
+            max(1, int(round(img.width * ratio))),
+            max(1, int(round(img.height * ratio))),
+        )
+        img = img.resize(size, Image.Resampling.LANCZOS)
+        img.save(image_path)
+        return img.width, img.height
+
+
 def video_fingerprint(record: dict) -> dict:
     path = Path(record["path"])
     stat = path.stat()
@@ -465,7 +736,10 @@ def video_fingerprint(record: dict) -> dict:
 
 
 def enhancement_settings(request: ExportRequest) -> dict:
-    settings = request.model_dump(exclude={"crf", "encoder"}, mode="json")
+    settings = request.model_dump(
+        exclude={"crf", "encoder", "seedvr2PreviewSize", "flashvsrPreviewCap"},
+        mode="json",
+    )
     upscale = settings.get("upscale")
     if isinstance(upscale, float) and upscale.is_integer():
         settings["upscale"] = int(upscale)
@@ -474,7 +748,7 @@ def enhancement_settings(request: ExportRequest) -> dict:
 
 def enhancement_cache_key(record: dict, request: ExportRequest) -> str:
     payload = {
-        "engineVersion": "hypir-sd2-v1",
+        "engineVersion": ENGINE_VERSION.get(request.engine, request.engine),
         "video": video_fingerprint(record),
         "settings": enhancement_settings(request),
     }
@@ -482,10 +756,106 @@ def enhancement_cache_key(record: dict, request: ExportRequest) -> str:
     return hashlib.sha256(raw).hexdigest()
 
 
+def requested_output_longest_side(metadata: dict, request: ProcessSettings) -> int:
+    source_longest = max(int(metadata.get("width") or 0), int(metadata.get("height") or 0))
+    if request.scaleBy == "longest_side":
+        return max(1, int(request.targetLongestSide or source_longest or 1))
+    native_scale = max(1.0, min(4.0, float(request.upscale or 1.0)))
+    return max(1, int(round(source_longest * native_scale)))
+
+
+def estimated_output_size(metadata: dict, longest_side: int) -> tuple[int, int]:
+    source_width = max(1, int(metadata.get("width") or 1))
+    source_height = max(1, int(metadata.get("height") or 1))
+    if source_width >= source_height:
+        width = longest_side
+        height = max(1, int(round(longest_side * source_height / source_width)))
+    else:
+        height = longest_side
+        width = max(1, int(round(longest_side * source_width / source_height)))
+    return width, height
+
+
+def gpu_total_memory_mb() -> int | None:
+    try:
+        proc = subprocess.run(
+            [
+                "nvidia-smi",
+                "--query-gpu=memory.total",
+                "--format=csv,noheader,nounits",
+            ],
+            text=True,
+            capture_output=True,
+            timeout=10,
+            check=True,
+        )
+        first = proc.stdout.strip().splitlines()[0].strip()
+        return int(first)
+    except Exception:
+        return None
+
+
+def flashvsr_native_pixel_budget(total_vram_mb: int | None) -> int:
+    if total_vram_mb is None:
+        return 2_100_000
+    if total_vram_mb >= 48_000:
+        return 12_500_000
+    if total_vram_mb >= 32_000:
+        return 8_500_000
+    if total_vram_mb >= 24_000:
+        return 3_000_000
+    return 2_100_000
+
+
+def flashvsr_native_export_blocker(metadata: dict, request: ExportRequest) -> str | None:
+    source_width = int(metadata.get("width") or 0)
+    source_height = int(metadata.get("height") or 0)
+    source_longest = max(source_width, source_height)
+    requested_longest = requested_output_longest_side(metadata, request)
+    if requested_longest < FLASHVSR_NATIVE_MIN_LONGEST_SIDE:
+        return (
+            f"FlashVSR native export needs at least {FLASHVSR_NATIVE_MIN_LONGEST_SIDE}px longest side. "
+            f"The selected value is {requested_longest}px. Increase Resolution/Scale Mode or choose another engine."
+        )
+    if source_longest > 0 and requested_longest < source_longest:
+        return (
+            f"FlashVSR cannot natively downscale this {source_width}x{source_height} source "
+            f"to {requested_longest}px longest side. Choose a resolution at least {source_longest}px "
+            "or use another export path."
+        )
+    native_scale_limit = max(1, int(source_longest * 4))
+    if requested_longest > native_scale_limit:
+        return (
+            f"FlashVSR cannot natively export {requested_longest}px from this "
+            f"{source_width}x{source_height} source. This FlashVSR model path is limited "
+            f"to 4x native upscale here, about {native_scale_limit}px longest side. "
+            "Lower Resolution/Scale Mode or choose another engine."
+        )
+
+    estimated_width, estimated_height = estimated_output_size(metadata, requested_longest)
+    estimated_pixels = estimated_width * estimated_height
+    total_vram_mb = gpu_total_memory_mb()
+    pixel_budget = flashvsr_native_pixel_budget(total_vram_mb)
+    if estimated_pixels > pixel_budget:
+        vram_text = f"{total_vram_mb // 1024}GB VRAM" if total_vram_mb else "unknown VRAM"
+        aspect_long = max(1, source_width, source_height)
+        aspect_short = max(1, min(source_width or 1, source_height or 1))
+        max_side_hint = int(math.sqrt(pixel_budget * aspect_long / aspect_short))
+        return (
+            f"FlashVSR native export at about {estimated_width}x{estimated_height} "
+            f"({estimated_pixels / 1_000_000:.1f} MP/frame) is above this system's safe native "
+            f"budget for FlashVSR ({vram_text}, about {pixel_budget / 1_000_000:.1f} MP/frame). "
+            f"Lower Resolution/Scale Mode, for example to about {max(640, max_side_hint)}px longest side or less."
+        )
+
+    return None
+
+
 def export_output_path(record: dict, cache_key: str, request: ExportRequest) -> Path:
     payload = {"cacheKey": cache_key, "crf": request.crf, "encoder": request.encoder}
     suffix = hashlib.sha256(json.dumps(payload, sort_keys=True).encode("utf-8")).hexdigest()[:8]
-    output_name = f"{Path(record['name']).stem}_hypir_h264_{cache_key[:8]}_q{request.crf}_{suffix}.mp4"
+    engine_tag = safe_name(request.engine)
+    output_name = f"{Path(record['name']).stem}_{engine_tag}_h264_{cache_key[:8]}_q{request.crf}_{suffix}.mp4"
     return EXPORT_DIR / safe_name(output_name)
 
 
@@ -664,20 +1034,75 @@ def startup() -> None:
     load_adapter_records()
 
 
-@app.get("/api/status")
-def status() -> dict:
+@app.get("/api/health")
+def health() -> dict:
     with jobs_lock:
         active_jobs = sum(1 for job in jobs.values() if job.status in {"queued", "running"})
     return {
         "app": "CleanVideo",
         "build": APP_BUILD,
-        "hypir": engine.status(),
+        "activeJobs": active_jobs,
+    }
+
+
+@app.get("/api/status")
+def status() -> dict:
+    with jobs_lock:
+        active_jobs = sum(1 for job in jobs.values() if job.status in {"queued", "running"})
+    hypir_status = engine.status()
+    seedvr2_status = seedvr2_engine.status()
+    flashvsr_status = flashvsr_engine.status()
+    return {
+        "app": "CleanVideo",
+        "build": APP_BUILD,
+        "hypir": hypir_status,
+        "seedvr2": seedvr2_status,
+        "flashvsr": flashvsr_status,
+        "engines": {
+            "hypir": hypir_status,
+            "seedvr2": seedvr2_status,
+            "flashvsr": flashvsr_status,
+        },
         "ffmpeg": True,
         "nvenc": h264_nvenc_available(),
         "videos": len(videos),
         "jobs": len(jobs),
         "activeJobs": active_jobs,
     }
+
+
+def engine_ready_error(engine_name: str) -> str | None:
+    if engine_name == "hypir":
+        hypir_status = engine.status()
+        missing = []
+        if not hypir_status.get("cudaAvailable"):
+            missing.append("CUDA")
+        if not hypir_status.get("weightPresent"):
+            missing.append("HYPIR weights")
+        if not hypir_status.get("baseModelPresent"):
+            missing.append("Stable Diffusion 2.1 base model")
+        if missing:
+            return f"HYPIR is not ready: {', '.join(missing)}"
+        return None
+    if engine_name == "seedvr2":
+        seed_status = seedvr2_engine.status()
+        if seed_status.get("available"):
+            return None
+        missing = seed_status.get("missing") or []
+        return f"SeedVR2 is not ready: {', '.join(missing) or 'engine dependencies are missing'}"
+    if engine_name == "flashvsr":
+        flash_status = flashvsr_engine.status()
+        if flash_status.get("available"):
+            return None
+        reason = flash_status.get("blockedReason")
+        missing = flash_status.get("missing") or []
+        return f"FlashVSR is not ready: {reason or ', '.join(missing) or 'engine dependencies are missing'}"
+    return f"Unknown engine: {engine_name}"
+
+
+def ensure_engine_ready(engine_name: str) -> None:
+    if error := engine_ready_error(engine_name):
+        raise HTTPException(status_code=409, detail=error)
 
 
 @app.get("/api/videos")
@@ -1104,7 +1529,7 @@ def run_adapter_training(job_id: str, request: AdapterTrainRequest) -> None:
             progress=0,
             message="Film adapter training failed",
             etaSeconds=None,
-            error=f"{exc}\n{traceback.format_exc()}",
+            error=user_facing_error(exc),
         )
     finally:
         if process is not None and process.poll() is None:
@@ -1199,23 +1624,129 @@ async def upload_video(file: UploadFile = File(...)) -> dict:
 @app.post("/api/preview")
 def preview_frame(request: PreviewRequest) -> dict:
     record = get_video(request.videoId)
-    adapter_weight_path = get_adapter_weight_path(request.adapterId)
+    ensure_engine_ready(request.engine)
+    preview_token = start_preview_run()
     preview_id = uuid.uuid4().hex
     preview_root = PREVIEW_DIR / preview_id
     original = preview_root / "original.png"
     enhanced = preview_root / "enhanced.png"
     adapter_preview: Path | None = None
+    result: dict | None = None
+
+    def on_preview_process(process: subprocess.Popen) -> None:
+        register_preview_process(preview_token, process)
+
+    def should_cancel_preview() -> bool:
+        return preview_should_cancel(preview_token)
+
     try:
         extract_frame(Path(record["path"]), request.seconds, original)
-        if second_pass_enabled(request):
-            adapter_preview = preview_root / "adapter_pass.png"
-            engine.enhance_file(original, adapter_preview, request.to_hypir(adapter_weight_path))
-            result = engine.enhance_file(adapter_preview, enhanced, request.to_base_refine_hypir())
+        if request.engine == "seedvr2":
+            safe_original = preview_root / "seedvr2_preview_source.png"
+            safe_width, safe_height = create_seedvr2_preview_source(
+                original,
+                safe_original,
+                request.seedvr2PreviewSize,
+            )
+            engine_started = time.monotonic()
+            result = seedvr2_engine.enhance_file(
+                safe_original,
+                enhanced,
+                request.to_seedvr2_preview(),
+                on_process=on_preview_process,
+                should_cancel=should_cancel_preview,
+                low_priority=True,
+            )
+            elapsed = time.monotonic() - engine_started
+            result["previewMode"] = "seedvr2_safe"
+            result["sourceWidth"] = safe_width
+            result["sourceHeight"] = safe_height
+            result["framesProcessed"] = 1
+            result["elapsedSeconds"] = round(elapsed, 3)
+            result["averageFrameSeconds"] = round(elapsed, 3)
+            result["metricResolution"] = f"{result.get('width') or safe_width}x{result.get('height') or safe_height}"
+        elif request.engine == "flashvsr":
+            preview_clip = preview_root / "flashvsr_preview_input.mp4"
+            preview_video = preview_root / "flashvsr_preview_output.mp4"
+            requested_preview_cap = request.flashvsrPreviewCap
+            effective_preview_cap = requested_preview_cap
+            flash_preview_upscale = False
+            if requested_preview_cap > FLASHVSR_PREVIEW_SAFE_MODEL_LONGEST_SIDE:
+                effective_preview_cap = FLASHVSR_PREVIEW_SAFE_MODEL_LONGEST_SIDE
+                flash_preview_upscale = True
+            safe_width, safe_height, clip_start, clip_duration = create_short_preview_clip(
+                Path(record["path"]),
+                preview_clip,
+                request.seconds,
+                effective_preview_cap,
+                max_frames=FLASHVSR_PREVIEW_FRAMES,
+            )
+            clip_frames = max(1, int(round(clip_duration * max(1.0, float(record["metadata"].get("fps") or 30.0)))))
+            flash_settings = request.to_flashvsr_preview()
+            if effective_preview_cap != requested_preview_cap:
+                flash_settings = replace(flash_settings, target_longest_side=effective_preview_cap)
+            engine_started = time.monotonic()
+            result = flashvsr_engine.enhance_video(
+                preview_clip,
+                preview_video,
+                flash_settings,
+                source_longest_side=max(safe_width, safe_height),
+                on_process=on_preview_process,
+                should_cancel=should_cancel_preview,
+                low_priority=True,
+                timeout_seconds=FLASHVSR_PREVIEW_TIMEOUT_SECONDS,
+            )
+            elapsed = time.monotonic() - engine_started
+            preview_seconds = min(max(0.0, request.seconds - clip_start), max(0.0, clip_duration - 0.001))
+            extract_frame(preview_video, preview_seconds, enhanced)
+            with Image.open(enhanced) as img:
+                result["width"] = img.width
+                result["height"] = img.height
+            model_width = result["width"]
+            model_height = result["height"]
+            if flash_preview_upscale:
+                final_width, final_height = upscale_image_to_longest_side(enhanced, requested_preview_cap)
+                result["width"] = final_width
+                result["height"] = final_height
+                result["modelWidth"] = model_width
+                result["modelHeight"] = model_height
+                result["previewMode"] = f"flashvsr_{request.flashvsrVariant}_4k_safe"
+            else:
+                result["previewMode"] = "flashvsr_safe"
+            result["sourceWidth"] = safe_width
+            result["sourceHeight"] = safe_height
+            result["clipSeconds"] = round(clip_duration, 3)
+            result["framesProcessed"] = clip_frames
+            result["elapsedSeconds"] = round(elapsed, 3)
+            result["averageFrameSeconds"] = round(elapsed / max(1, clip_frames), 3)
+            result["metricResolution"] = (
+                f"{model_width}x{model_height} -> {result['width']}x{result['height']}"
+                if flash_preview_upscale
+                else f"{result['width']}x{result['height']}"
+            )
         else:
-            result = engine.enhance_file(original, enhanced, request.to_hypir(adapter_weight_path))
+            adapter_weight_path = get_adapter_weight_path(request.adapterId)
+            engine_started = time.monotonic()
+            if second_pass_enabled(request):
+                adapter_preview = preview_root / "adapter_pass.png"
+                engine.enhance_file(original, adapter_preview, request.to_hypir(adapter_weight_path))
+                result = engine.enhance_file(adapter_preview, enhanced, request.to_base_refine_hypir())
+            else:
+                result = engine.enhance_file(original, enhanced, request.to_hypir(adapter_weight_path))
+            elapsed = time.monotonic() - engine_started
+            result["previewMode"] = "hypir_preview"
+            result["framesProcessed"] = 1
+            result["elapsedSeconds"] = round(elapsed, 3)
+            result["averageFrameSeconds"] = round(elapsed, 3)
+            result["metricResolution"] = f"{result.get('width')}x{result.get('height')}"
+    except RuntimeError as exc:
+        if "cancelled" in str(exc).lower():
+            raise HTTPException(status_code=409, detail="Preview cancelled by a newer request") from exc
+        raise HTTPException(status_code=500, detail=f"Preview failed: {exc}") from exc
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Preview failed: {exc}") from exc
     finally:
+        finish_preview_run(preview_token)
         if adapter_preview is not None:
             adapter_preview.unlink(missing_ok=True)
 
@@ -1229,11 +1760,268 @@ def preview_frame(request: PreviewRequest) -> dict:
     }
 
 
+@app.post("/api/preview/cancel")
+def cancel_preview() -> dict:
+    return {"cancelled": cancel_preview_runs()}
+
+
 def second_pass_enabled(request: ProcessSettings) -> bool:
-    return request.secondPass == "base_after_adapter" and request.adapterId != "base"
+    return request.engine == "hypir" and request.secondPass == "base_after_adapter" and request.adapterId != "base"
+
+
+def run_native_video_export(job_id: str, request: ExportRequest) -> None:
+    try:
+        record = get_video(request.videoId)
+        source = Path(record["path"])
+        metadata = record["metadata"]
+        expected_count = int(metadata.get("frameCount") or 0)
+        cache_key = enhancement_cache_key(record, request)
+        output_path = export_output_path(record, cache_key, request)
+        if job_id in cancelled_jobs:
+            update_job(job_id, status="cancelled", progress=0, message="Stopped before export started")
+            cancelled_jobs.discard(job_id)
+            return
+        if output_path.exists() and output_path.stat().st_size > 0:
+            update_job(
+                job_id,
+                status="done",
+                progress=1.0,
+                message=f"Done. Reused cached {request.engine} output",
+                etaSeconds=0,
+                framesDone=expected_count,
+                framesTotal=expected_count,
+                partialFramesReady=0,
+                cacheKey=cache_key,
+                outputUrl=f"/media/exports/{output_path.name}",
+                outputPath=str(output_path),
+            )
+            return
+
+        cache_root = CACHE_DIR / cache_key
+        cache_root.mkdir(parents=True, exist_ok=True)
+        write_cache_manifest(cache_root, record, request, "running")
+        raw_output = cache_root / f"{request.engine}_processed.mp4"
+        log_path = cache_root / f"{request.engine}.log"
+        label = "SeedVR2" if request.engine == "seedvr2" else "FlashVSR"
+        update_job(
+            job_id,
+            status="running",
+            progress=0.02,
+            message=f"Starting {label} video-native export",
+            framesDone=0,
+            framesTotal=expected_count,
+            partialFramesReady=0,
+            cacheKey=cache_key,
+        )
+
+        progress_state = {"progress": 0.05}
+
+        def on_process(process: subprocess.Popen) -> None:
+            job_processes[job_id] = process
+
+        def on_line(line: str) -> None:
+            if line:
+                with log_path.open("a", encoding="utf-8", errors="replace") as log:
+                    log.write(line + "\n")
+            progress_state["progress"] = min(0.88, progress_state["progress"] + 0.003)
+            message = f"{label}: {line[:140]}" if line else f"{label}: running"
+            update_job(
+                job_id,
+                progress=progress_state["progress"],
+                message=message,
+                framesDone=0,
+                framesTotal=expected_count,
+                partialFramesReady=0,
+            )
+
+        def should_cancel() -> bool:
+            return job_id in cancelled_jobs
+
+        engine_started = time.monotonic()
+        try:
+            if request.engine == "seedvr2":
+                seedvr2_engine.enhance_video(
+                    source,
+                    raw_output,
+                    request.to_seedvr2(),
+                    on_line=on_line,
+                    on_process=on_process,
+                    should_cancel=should_cancel,
+                )
+            elif request.engine == "flashvsr":
+                if blocker := flashvsr_native_export_blocker(metadata, request):
+                    raise RuntimeError(blocker)
+
+                fps = max(1.0, float(metadata.get("fps") or 30.0))
+                total_frames = max(1, expected_count)
+                chunk_frames = FLASHVSR_EXPORT_CHUNK_FRAMES
+                total_chunks = math.ceil(total_frames / chunk_frames)
+                chunk_input_dir = cache_root / "flashvsr_input_chunks"
+                chunk_output_dir = cache_root / "flashvsr_output_chunks"
+                shutil.rmtree(chunk_input_dir, ignore_errors=True)
+                shutil.rmtree(chunk_output_dir, ignore_errors=True)
+                chunk_input_dir.mkdir(parents=True, exist_ok=True)
+                chunk_output_dir.mkdir(parents=True, exist_ok=True)
+                chunk_outputs: list[Path] = []
+                flash_settings = request.to_flashvsr()
+
+                for chunk_index, start_frame in enumerate(range(0, total_frames, chunk_frames), start=1):
+                    if should_cancel():
+                        raise RuntimeError("FlashVSR export cancelled")
+                    frames_in_chunk = min(chunk_frames, total_frames - start_frame)
+                    chunk_input = chunk_input_dir / f"chunk_{chunk_index:05d}.mp4"
+                    chunk_output = chunk_output_dir / f"chunk_{chunk_index:05d}.mp4"
+                    model_chunk_output = chunk_output
+                    if frames_in_chunk < chunk_frames:
+                        model_chunk_output = chunk_output_dir / f"chunk_{chunk_index:05d}_padded.mp4"
+                    update_job(
+                        job_id,
+                        progress=min(0.88, 0.05 + 0.83 * (start_frame / total_frames)),
+                        message=f"FlashVSR preparing chunk {chunk_index}/{total_chunks}",
+                        framesDone=start_frame,
+                        framesTotal=expected_count,
+                        partialFramesReady=0,
+                    )
+                    chunk_meta = create_video_chunk(
+                        source,
+                        chunk_input,
+                        start_frame,
+                        frames_in_chunk,
+                        fps,
+                        longest_side_cap=requested_output_longest_side(metadata, request),
+                        min_frame_count=chunk_frames,
+                    )
+
+                    def on_chunk_line(line: str, chunk_no: int = chunk_index, done_frames: int = start_frame) -> None:
+                        if line:
+                            with log_path.open("a", encoding="utf-8", errors="replace") as log:
+                                log.write(f"[chunk {chunk_no}/{total_chunks}] {line}\n")
+                        chunk_progress = min(0.88, 0.05 + 0.83 * (done_frames / total_frames))
+                        update_job(
+                            job_id,
+                            progress=chunk_progress,
+                            message=f"FlashVSR chunk {chunk_no}/{total_chunks}: {line[:100]}" if line else f"FlashVSR chunk {chunk_no}/{total_chunks}",
+                            framesDone=done_frames,
+                            framesTotal=expected_count,
+                            partialFramesReady=0,
+                        )
+
+                    flashvsr_engine.enhance_video(
+                        chunk_input,
+                        model_chunk_output,
+                        flash_settings,
+                        source_longest_side=max(chunk_meta.get("width") or 0, chunk_meta.get("height") or 0),
+                        on_line=on_chunk_line,
+                        on_process=on_process,
+                        should_cancel=should_cancel,
+                    )
+                    if model_chunk_output != chunk_output:
+                        trim_video_frame_count(model_chunk_output, chunk_output, frames_in_chunk)
+                    chunk_outputs.append(chunk_output)
+                    completed_frames = min(total_frames, start_frame + frames_in_chunk)
+                    update_job(
+                        job_id,
+                        progress=min(0.88, 0.05 + 0.83 * (completed_frames / total_frames)),
+                        message=f"FlashVSR completed chunk {chunk_index}/{total_chunks}",
+                        framesDone=completed_frames,
+                        framesTotal=expected_count,
+                        partialFramesReady=0,
+                    )
+
+                update_job(
+                    job_id,
+                    progress=0.9,
+                    message="Concatenating FlashVSR chunks",
+                    framesDone=expected_count,
+                    framesTotal=expected_count,
+                    partialFramesReady=0,
+                )
+                concat_videos_copy(chunk_outputs, raw_output)
+            else:
+                raise ValueError(f"Unsupported native video engine: {request.engine}")
+            engine_elapsed = time.monotonic() - engine_started
+        except RuntimeError as exc:
+            if "cancelled" in str(exc).lower():
+                write_cache_manifest(cache_root, record, request, "cancelled")
+                update_job(
+                    job_id,
+                    status="cancelled",
+                    progress=progress_state["progress"],
+                    message=f"{label} export cancelled",
+                    etaSeconds=None,
+                    framesDone=0,
+                    framesTotal=expected_count,
+                    partialFramesReady=0,
+                )
+                cancelled_jobs.discard(job_id)
+                return
+            raise
+        finally:
+            job_processes.pop(job_id, None)
+
+        if job_id in cancelled_jobs:
+            write_cache_manifest(cache_root, record, request, "cancelled")
+            update_job(
+                job_id,
+                status="cancelled",
+                progress=progress_state["progress"],
+                message=f"{label} export cancelled",
+                etaSeconds=None,
+                framesDone=0,
+                framesTotal=expected_count,
+                partialFramesReady=0,
+            )
+            cancelled_jobs.discard(job_id)
+            return
+
+        try:
+            raw_meta = probe_video(raw_output)
+            metric_resolution = f"{raw_meta.get('width')}x{raw_meta.get('height')}"
+        except Exception:
+            metric_resolution = None
+        average_frame_seconds = engine_elapsed / max(1, expected_count)
+        update_job(job_id, progress=0.92, message="Muxing processed video with source audio", etaSeconds=None)
+        mux_mode = remux_video_with_source_audio(raw_output, source, output_path)
+        write_cache_manifest(cache_root, record, request, "complete")
+        cleanup_message = "Scheduled intermediate cleanup"
+        try:
+            cleanup_usage = schedule_generated_path_cleanup(cache_root, delay_seconds=900)
+            cleanup_message = f"Scheduled cleanup of {cleanup_usage['files']} intermediate files"
+        except Exception as exc:
+            cleanup_message = f"Intermediate cleanup failed: {exc}"
+        update_job(
+            job_id,
+            status="done",
+            progress=1.0,
+            message=f"Done. {label} output muxed with {mux_mode}. {cleanup_message}",
+            etaSeconds=0,
+            framesDone=expected_count,
+            framesTotal=expected_count,
+            partialFramesReady=0,
+            averageFrameSeconds=round(average_frame_seconds, 3),
+            metricResolution=metric_resolution,
+            metricSource="export",
+            outputUrl=f"/media/exports/{output_path.name}",
+            outputPath=str(output_path),
+        )
+    except Exception as exc:
+        update_job(
+            job_id,
+            status="error",
+            progress=0,
+            message="Export failed",
+            etaSeconds=None,
+            error=user_facing_error(exc),
+        )
+    finally:
+        job_processes.pop(job_id, None)
+        cancelled_jobs.discard(job_id)
 
 
 def run_export(job_id: str, request: ExportRequest) -> None:
+    if request.engine in {"seedvr2", "flashvsr"}:
+        run_native_video_export(job_id, request)
+        return
     try:
         record = get_video(request.videoId)
         source = Path(record["path"])
@@ -1414,6 +2202,17 @@ def run_export(job_id: str, request: ExportRequest) -> None:
                         cached=False,
                     )
                     latest_frame_seq = frame_event.seq
+                elif valid_image(output):
+                    frame_event = add_frame_event(
+                        job_id,
+                        frame_index=index,
+                        frames_total=total,
+                        seconds=(index - 1) / fps,
+                        original_path=frame,
+                        enhanced_path=output,
+                        cached=True,
+                    )
+                    latest_frame_seq = frame_event.seq
 
                 frame_seconds = (index - 1) / fps
                 remaining_misses = max(0, missing_total - cache_misses_done)
@@ -1433,6 +2232,13 @@ def run_export(job_id: str, request: ExportRequest) -> None:
                     partialFramesReady=partial_frames_ready,
                     cacheHits=cache_hits,
                     cacheMisses=cache_misses_done,
+                    averageFrameSeconds=(
+                        round(generation_elapsed / cache_misses_done, 3)
+                        if cache_misses_done
+                        else None
+                    ),
+                    metricResolution=image_resolution_label(output),
+                    metricSource="export",
                 )
                 previous_source_frame = frame
                 previous_enhanced_frame = output
@@ -1500,6 +2306,17 @@ def run_export(job_id: str, request: ExportRequest) -> None:
                         cached=False,
                     )
                     latest_frame_seq = frame_event.seq
+                elif valid_image(output):
+                    frame_event = add_frame_event(
+                        job_id,
+                        frame_index=index,
+                        frames_total=total,
+                        seconds=(index - 1) / fps,
+                        original_path=frame,
+                        enhanced_path=output,
+                        cached=True,
+                    )
+                    latest_frame_seq = frame_event.seq
 
                 frame_seconds = (index - 1) / fps
                 remaining_misses = max(0, missing_total - cache_misses_done)
@@ -1519,6 +2336,13 @@ def run_export(job_id: str, request: ExportRequest) -> None:
                     partialFramesReady=partial_frames_ready,
                     cacheHits=cache_hits,
                     cacheMisses=cache_misses_done,
+                    averageFrameSeconds=(
+                        round(generation_elapsed / cache_misses_done, 3)
+                        if cache_misses_done
+                        else None
+                    ),
+                    metricResolution=image_resolution_label(output),
+                    metricSource="export",
                 )
                 previous_source_frame = frame
                 previous_enhanced_frame = output
@@ -1559,7 +2383,7 @@ def run_export(job_id: str, request: ExportRequest) -> None:
             progress=0,
             message="Export failed",
             etaSeconds=None,
-            error=f"{exc}\n{traceback.format_exc()}",
+            error=user_facing_error(exc),
         )
     finally:
         cancelled_jobs.discard(job_id)
@@ -1568,6 +2392,7 @@ def run_export(job_id: str, request: ExportRequest) -> None:
 @app.post("/api/export")
 def export_video(request: ExportRequest, background_tasks: BackgroundTasks) -> dict:
     get_video(request.videoId)
+    ensure_engine_ready(request.engine)
     job_id = uuid.uuid4().hex
     stamp = now_iso()
     with jobs_lock:
@@ -1577,6 +2402,7 @@ def export_video(request: ExportRequest, background_tasks: BackgroundTasks) -> d
             status="queued",
             progress=0,
             message="Queued",
+            engine=request.engine,
             videoId=request.videoId,
             startedAt=stamp,
             updatedAt=stamp,

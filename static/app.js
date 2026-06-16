@@ -1,8 +1,20 @@
+const defaultEngine = "flashvsr";
+const settingsStorageVersion = 2;
+const settingsStorageKey = "cleanvideo.session.v1";
+const engineMetricsStorageKey = "cleanvideo.engineMetrics.v1";
+const previewTimeoutMsByEngine = {
+  flashvsr: 5 * 60 * 1000,
+  seedvr2: 3 * 60 * 1000,
+  hypir: 2 * 60 * 1000,
+};
+
 const state = {
+  engine: defaultEngine,
   video: null,
   jobTimer: null,
   currentJobId: null,
   previewTimer: null,
+  previewController: null,
   previewInFlight: false,
   previewDirty: false,
   previewVersion: 0,
@@ -16,15 +28,20 @@ const state = {
   liveOriginalUrl: null,
   liveEnhancedUrl: null,
   frameEventQueue: [],
+  readyFrameEvents: [],
+  readyFrameSeqs: new Set(),
   frameEventsAfter: 0,
   frameEventsInFlight: false,
   framePlaybackTimer: null,
+  readyPlaybackTimer: null,
+  readyPlaybackActive: false,
+  readyPlaybackIndex: 0,
   lastDisplayedFrameSeq: 0,
   lastExportFramesDone: 0,
   lastExportFramesTotal: 0,
+  status: null,
+  engineMetrics: {},
 };
-
-const settingsStorageKey = "cleanvideo.session.v1";
 
 const resolutionPresets = {
   preset_720p: 1280,
@@ -33,10 +50,21 @@ const resolutionPresets = {
   preset_8k: 7680,
 };
 
+const engineLabels = {
+  hypir: "HYPIR",
+  seedvr2: "SeedVR2",
+  flashvsr: "FlashVSR",
+};
+
 const els = {
+  engineCards: Array.from(document.querySelectorAll(".engine-card[data-engine]")),
   videoInput: document.querySelector("#videoInput"),
   videoName: document.querySelector("#videoName"),
   videoMeta: document.querySelector("#videoMeta"),
+  comparisonBox: document.querySelector("#comparisonBox"),
+  comparisonAfterClip: document.querySelector("#comparisonAfterClip"),
+  comparisonDivider: document.querySelector("#comparisonDivider"),
+  comparisonHandle: document.querySelector("#comparisonHandle"),
   sourceVideo: document.querySelector("#sourceVideo"),
   originalPreview: document.querySelector("#originalPreview"),
   enhancedPreview: document.querySelector("#enhancedPreview"),
@@ -47,6 +75,9 @@ const els = {
   timeline: document.querySelector("#timeline"),
   currentTime: document.querySelector("#currentTime"),
   durationTime: document.querySelector("#durationTime"),
+  previewButton: document.querySelector("#previewButton"),
+  playReadyButton: document.querySelector("#playReadyButton"),
+  playReadyLabel: document.querySelector("#playReadyLabel"),
   exportButton: document.querySelector("#exportButton"),
   cancelExportButton: document.querySelector("#cancelExportButton"),
   partialExportButton: document.querySelector("#partialExportButton"),
@@ -73,6 +104,15 @@ const els = {
   adapterSelect: document.querySelector("#adapterSelect"),
   secondPass: document.querySelector("#secondPass"),
   adapterQuality: document.querySelector("#adapterQuality"),
+  seedvr2BatchSize: document.querySelector("#seedvr2BatchSize"),
+  seedvr2TemporalOverlap: document.querySelector("#seedvr2TemporalOverlap"),
+  seedvr2ChunkSize: document.querySelector("#seedvr2ChunkSize"),
+  seedvr2ColorCorrection: document.querySelector("#seedvr2ColorCorrection"),
+  seedvr2PreviewSize: document.querySelector("#seedvr2PreviewSize"),
+  flashvsrVariant: document.querySelector("#flashvsrVariant"),
+  flashvsrSparseRatio: document.querySelector("#flashvsrSparseRatio"),
+  flashvsrLocalRange: document.querySelector("#flashvsrLocalRange"),
+  flashvsrPreviewCap: document.querySelector("#flashvsrPreviewCap"),
   deleteAdapterButton: document.querySelector("#deleteAdapterButton"),
   deleteAllAdaptersButton: document.querySelector("#deleteAllAdaptersButton"),
   trainAdapterButton: document.querySelector("#trainAdapterButton"),
@@ -88,6 +128,8 @@ const tooltip = document.createElement("div");
 tooltip.className = "tooltip-popover";
 tooltip.setAttribute("role", "tooltip");
 document.body.appendChild(tooltip);
+
+let comparisonDragging = false;
 
 function formatTime(seconds) {
   const safe = Number.isFinite(seconds) ? Math.max(0, seconds) : 0;
@@ -179,15 +221,176 @@ function formatBytes(bytes) {
   return `${value.toFixed(digits)} ${units[unitIndex]}`;
 }
 
+function compactUiMessage(message, limit = 260) {
+  const raw = String(message || "");
+  const singleLine = raw.replace(/\s+/g, " ").trim();
+  if (singleLine.length <= limit) return singleLine;
+  return `${singleLine.slice(0, Math.max(0, limit - 1)).trim()}…`;
+}
+
 function setActivity(message, progress = null) {
-  els.activityText.textContent = message;
+  const raw = String(message || "");
+  els.activityText.textContent = compactUiMessage(raw);
+  els.activityText.title = raw;
   if (progress !== null) {
     els.jobProgress.style.width = `${Math.max(0, Math.min(1, progress)) * 100}%`;
   }
 }
 
+function updateComparisonVisibility() {
+  const active = !els.originalPreview.hidden && !els.enhancedPreview.hidden;
+  els.comparisonAfterClip.hidden = !active;
+  els.comparisonDivider.hidden = !active;
+  els.comparisonHandle.hidden = !active;
+  els.comparisonBox.classList.toggle("comparison-active", active);
+}
+
+function setComparisonPositionFromClientX(clientX) {
+  const rect = els.comparisonBox.getBoundingClientRect();
+  if (!rect.width) return;
+  const percent = Math.max(5, Math.min(95, ((clientX - rect.left) / rect.width) * 100));
+  els.comparisonBox.style.setProperty("--compare-pos", `${percent.toFixed(2)}%`);
+}
+
+function comparisonPosition() {
+  const raw = getComputedStyle(els.comparisonBox).getPropertyValue("--compare-pos").trim() || "50%";
+  const numeric = Number.parseFloat(raw);
+  return Number.isFinite(numeric) ? numeric : 50;
+}
+
+function setComparisonPosition(percent) {
+  const clamped = Math.max(5, Math.min(95, percent));
+  els.comparisonBox.style.setProperty("--compare-pos", `${clamped.toFixed(2)}%`);
+}
+
+function beginComparisonDrag(event) {
+  if (!els.comparisonBox.classList.contains("comparison-active")) return;
+  event.preventDefault();
+  comparisonDragging = true;
+  setComparisonPositionFromClientX(event.clientX);
+}
+
+function moveComparisonDrag(event) {
+  if (!comparisonDragging) return;
+  event.preventDefault();
+  setComparisonPositionFromClientX(event.clientX);
+}
+
+function endComparisonDrag() {
+  comparisonDragging = false;
+}
+
+function showSourceVideo() {
+  els.sourceVideo.hidden = false;
+  els.originalPreview.hidden = true;
+  els.enhancedPreview.hidden = true;
+  els.originalEmpty.hidden = true;
+  els.enhancedEmpty.hidden = true;
+  updateComparisonVisibility();
+}
+
+function showFramePair({ originalUrl, enhancedUrl, originalInfo, enhancedInfo }) {
+  if (originalUrl && state.liveOriginalUrl !== originalUrl) {
+    els.originalPreview.src = originalUrl;
+    state.liveOriginalUrl = originalUrl;
+  }
+  if (enhancedUrl && state.liveEnhancedUrl !== enhancedUrl) {
+    els.enhancedPreview.src = enhancedUrl;
+    state.liveEnhancedUrl = enhancedUrl;
+  }
+  els.sourceVideo.hidden = true;
+  els.originalPreview.hidden = false;
+  els.enhancedPreview.hidden = false;
+  els.originalEmpty.hidden = true;
+  els.enhancedEmpty.hidden = true;
+  if (originalInfo !== undefined) {
+    els.originalInfo.textContent = originalInfo;
+  }
+  if (enhancedInfo !== undefined) {
+    els.enhancedInfo.textContent = enhancedInfo;
+  }
+  updateComparisonVisibility();
+}
+
+function stopReadyPlayback() {
+  if (state.readyPlaybackTimer) {
+    window.clearTimeout(state.readyPlaybackTimer);
+  }
+  state.readyPlaybackTimer = null;
+  state.readyPlaybackActive = false;
+  state.readyPlaybackIndex = 0;
+  updateReadyPlaybackButton();
+}
+
+function updateReadyPlaybackButton() {
+  const count = state.readyFrameEvents.length;
+  els.playReadyButton.hidden = !state.exportInFlight && count === 0;
+  els.playReadyButton.disabled = count === 0;
+  els.playReadyLabel.textContent = state.readyPlaybackActive ? "Stop Ready" : `Play Ready${count ? ` (${count})` : ""}`;
+  els.playReadyButton.title = count
+    ? "Play generated PNG frames at the source FPS"
+    : "No generated PNG frames are ready yet";
+}
+
+function rememberReadyFrames(frames = []) {
+  for (const frame of frames) {
+    if (!frame?.originalUrl || !frame?.enhancedUrl || state.readyFrameSeqs.has(frame.seq)) continue;
+    state.readyFrameSeqs.add(frame.seq);
+    state.readyFrameEvents.push(frame);
+  }
+  state.readyFrameEvents.sort((a, b) => (a.frameIndex || a.seq) - (b.frameIndex || b.seq));
+  updateReadyPlaybackButton();
+}
+
+function readyPlaybackDelay() {
+  const fps = Number(state.video?.metadata?.fps || 30);
+  return Math.max(8, Math.round(1000 / Math.max(1, fps)));
+}
+
+function tickReadyPlayback() {
+  if (!state.readyPlaybackActive) return;
+  const frames = state.readyFrameEvents;
+  if (!frames.length || state.readyPlaybackIndex >= frames.length) {
+    stopReadyPlayback();
+    return;
+  }
+  displayFrameEvent(frames[state.readyPlaybackIndex]);
+  state.readyPlaybackIndex += 1;
+  state.readyPlaybackTimer = window.setTimeout(tickReadyPlayback, readyPlaybackDelay());
+}
+
+function toggleReadyPlayback() {
+  if (state.readyPlaybackActive) {
+    stopReadyPlayback();
+    return;
+  }
+  if (!state.readyFrameEvents.length) return;
+  if (state.framePlaybackTimer) {
+    window.clearTimeout(state.framePlaybackTimer);
+    state.framePlaybackTimer = null;
+  }
+  state.readyPlaybackActive = true;
+  state.readyPlaybackIndex = 0;
+  updateReadyPlaybackButton();
+  tickReadyPlayback();
+}
+
+function cancelActivePreviewRequest() {
+  window.clearTimeout(state.previewTimer);
+  state.previewDirty = false;
+  state.previewController?.abort();
+  if (state.previewInFlight) {
+    fetch("/api/preview/cancel", { method: "POST" }).catch(() => {});
+  }
+  state.previewVersion += 1;
+  state.previewInFlight = false;
+  state.previewController = null;
+  setExportEnabled(true);
+}
+
 function collectUiSettings() {
   return {
+    engine: state.engine,
     scaleBy: els.scaleBy.value,
     upscale: els.upscale.value,
     targetLongestSide: els.targetLongestSide.value,
@@ -197,6 +400,15 @@ function collectUiSettings() {
     adapterId: els.adapterSelect.value,
     secondPass: els.secondPass.value,
     adapterQuality: els.adapterQuality.value,
+    seedvr2BatchSize: els.seedvr2BatchSize.value,
+    seedvr2TemporalOverlap: els.seedvr2TemporalOverlap.value,
+    seedvr2ChunkSize: els.seedvr2ChunkSize.value,
+    seedvr2ColorCorrection: els.seedvr2ColorCorrection.value,
+    seedvr2PreviewSize: els.seedvr2PreviewSize.value,
+    flashvsrVariant: els.flashvsrVariant.value,
+    flashvsrSparseRatio: els.flashvsrSparseRatio.value,
+    flashvsrLocalRange: els.flashvsrLocalRange.value,
+    flashvsrPreviewCap: els.flashvsrPreviewCap.value,
     seed: els.seed.value,
     prompt: els.prompt.value,
     encoder: els.encoder.value,
@@ -206,6 +418,7 @@ function collectUiSettings() {
 
 function saveLocalState() {
   const payload = {
+    version: settingsStorageVersion,
     settings: collectUiSettings(),
     videoId: state.video?.id ?? null,
     currentJobId: state.exportInFlight ? state.currentJobId : null,
@@ -222,7 +435,57 @@ function readLocalState() {
   }
 }
 
-function applySavedSettings(settings = {}) {
+function readEngineMetrics() {
+  try {
+    return JSON.parse(localStorage.getItem(engineMetricsStorageKey) || "{}");
+  } catch {
+    return {};
+  }
+}
+
+function saveEngineMetrics() {
+  localStorage.setItem(engineMetricsStorageKey, JSON.stringify(state.engineMetrics));
+}
+
+function formatSecondsPerFrame(seconds) {
+  if (!Number.isFinite(seconds) || seconds <= 0) return "--";
+  if (seconds < 1) return `${Math.round(seconds * 1000)}ms/frame`;
+  if (seconds < 10) return `${seconds.toFixed(1)}s/frame`;
+  return `${Math.round(seconds)}s/frame`;
+}
+
+function metricLabel(metric) {
+  if (!metric?.averageFrameSeconds) return "Speed: --";
+  const source = metric.source === "export" ? "Export" : "Preview";
+  const resolution = metric.resolution ? ` @ ${metric.resolution}` : "";
+  return `${source}: ${formatSecondsPerFrame(metric.averageFrameSeconds)}${resolution}`;
+}
+
+function updateEngineSpeedLabels() {
+  const videoMetrics = state.video ? state.engineMetrics[state.video.id] || {} : {};
+  document.querySelectorAll("[data-engine-speed]").forEach((element) => {
+    element.textContent = metricLabel(videoMetrics[element.dataset.engineSpeed]);
+  });
+}
+
+function rememberEngineMetric(engine, metric) {
+  if (!state.video || !engine || !metric?.averageFrameSeconds) return;
+  const videoMetrics = state.engineMetrics[state.video.id] || {};
+  videoMetrics[engine] = {
+    averageFrameSeconds: Number(metric.averageFrameSeconds),
+    resolution: metric.resolution || null,
+    source: metric.source || "preview",
+    updatedAt: new Date().toISOString(),
+  };
+  state.engineMetrics[state.video.id] = videoMetrics;
+  saveEngineMetrics();
+  updateEngineSpeedLabels();
+}
+
+function applySavedSettings(settings = {}, { restoreEngine = true } = {}) {
+  if (restoreEngine && settings.engine && engineLabels[settings.engine]) {
+    state.engine = settings.engine;
+  }
   const entries = [
     ["scaleBy", els.scaleBy],
     ["upscale", els.upscale],
@@ -233,6 +496,15 @@ function applySavedSettings(settings = {}) {
     ["adapterId", els.adapterSelect],
     ["secondPass", els.secondPass],
     ["adapterQuality", els.adapterQuality],
+    ["seedvr2BatchSize", els.seedvr2BatchSize],
+    ["seedvr2TemporalOverlap", els.seedvr2TemporalOverlap],
+    ["seedvr2ChunkSize", els.seedvr2ChunkSize],
+    ["seedvr2ColorCorrection", els.seedvr2ColorCorrection],
+    ["seedvr2PreviewSize", els.seedvr2PreviewSize],
+    ["flashvsrVariant", els.flashvsrVariant],
+    ["flashvsrSparseRatio", els.flashvsrSparseRatio],
+    ["flashvsrLocalRange", els.flashvsrLocalRange],
+    ["flashvsrPreviewCap", els.flashvsrPreviewCap],
     ["seed", els.seed],
     ["prompt", els.prompt],
     ["encoder", els.encoder],
@@ -249,6 +521,7 @@ function applySavedSettings(settings = {}) {
   }
   els.crfValue.textContent = els.crf.value;
   updateScaleMode();
+  updateEngineUi();
   updateDeleteAdapterButton();
 }
 
@@ -298,7 +571,8 @@ function selectedRootAdapterRecord() {
 
 function canDeleteSelectedAdapter() {
   return Boolean(
-    selectedRootAdapterRecord()
+    state.engine === "hypir"
+    && selectedRootAdapterRecord()
     && !state.exportInFlight
     && !state.previewInFlight
     && !state.adapterInFlight
@@ -315,7 +589,8 @@ function rootAdapterRecords() {
 }
 
 function canDeleteAllAdapters() {
-  return rootAdapterRecords().length > 0
+  return state.engine === "hypir"
+    && rootAdapterRecords().length > 0
     && !state.exportInFlight
     && !state.previewInFlight
     && !state.adapterInFlight;
@@ -333,6 +608,104 @@ function updateDeleteAdapterButton() {
     : "No film adapters to delete";
 }
 
+function engineStatus(engine = state.engine) {
+  return state.status?.engines?.[engine] || state.status?.[engine] || null;
+}
+
+function isEngineAvailable(engine = state.engine) {
+  const status = engineStatus(engine);
+  if (!status) return engine === "hypir";
+  if (engine === "hypir") {
+    return Boolean(status.cudaAvailable && status.weightPresent && status.baseModelPresent);
+  }
+  return Boolean(status.available);
+}
+
+function enhancedInfoLabel(engine = state.engine) {
+  if (engine === "seedvr2" || engine === "flashvsr") {
+    return `${engineLabels[engine] || engine} auto preview`;
+  }
+  return `${engineLabels[engine] || engine} preview`;
+}
+
+function updateEngineSpecificControls() {
+  document.querySelectorAll("[data-engine-field]").forEach((element) => {
+    const engines = String(element.dataset.engineField || "").split(/\s+/).filter(Boolean);
+    const visible = engines.includes(state.engine);
+    element.hidden = !visible;
+  });
+}
+
+function updateEngineUi() {
+  updateEngineSpecificControls();
+  updateEngineSpeedLabels();
+  for (const card of els.engineCards) {
+    const engine = card.dataset.engine;
+    const selected = engine === state.engine;
+    const status = engineStatus(engine);
+    card.classList.toggle("selected", selected);
+    card.classList.toggle("blocked", Boolean(status && !isEngineAvailable(engine)));
+    card.setAttribute("aria-pressed", selected ? "true" : "false");
+    const small = card.querySelector("small");
+    if (!small) continue;
+    if (engine === "hypir") {
+      small.textContent = status?.loaded ? "Loaded" : "SD2 local CUDA";
+    } else if (status && !isEngineAvailable(engine)) {
+      small.textContent = "Blocked";
+    } else if (status?.available) {
+      small.textContent = "Ready";
+    }
+  }
+  const selectedLabel = engineLabels[state.engine] || state.engine;
+  const unavailable = !isEngineAvailable();
+  const status = engineStatus();
+  els.enhancedInfo.textContent = enhancedInfoLabel();
+  if (status) {
+    if (unavailable) {
+      els.modelStatus.textContent = "blocked";
+    } else if (status.loaded) {
+      els.modelStatus.textContent = "loaded";
+    } else if (status.available) {
+      els.modelStatus.textContent = "ready";
+    } else {
+      els.modelStatus.textContent = "cold";
+    }
+  }
+  els.trainAdapterButton.title = state.engine === "hypir"
+    ? "Create film-specific HYPIR adapter"
+    : "Film adapters are currently available only for HYPIR";
+  els.previewButton.hidden = true;
+  els.previewButton.title = `${selectedLabel} previews run automatically from the playhead`;
+  els.partialExportButton.title = state.engine === "hypir"
+    ? els.partialExportButton.title
+    : "Partial export is available only for HYPIR frame export";
+  if (unavailable && status) {
+    const reason = status?.blockedReason || status?.missing?.join(", ") || "engine is not ready";
+    setActivity(`${selectedLabel} blocked: ${reason}`, 0);
+  } else if (!unavailable && els.activityText.textContent.includes(" blocked:")) {
+    setActivity("Idle", 0);
+  }
+}
+
+function setEngine(engine, { persist = true, preview = true } = {}) {
+  if (!engineLabels[engine] || state.engine === engine) return;
+  if (state.previewInFlight || state.previewTimer) {
+    cancelActivePreviewRequest();
+  }
+  state.engine = engine;
+  if (engine !== "hypir") {
+    els.adapterSelect.value = "base";
+    els.secondPass.value = "off";
+  }
+  updateEngineUi();
+  updateDeleteAdapterButton();
+  setExportEnabled(!state.exportInFlight && !state.previewInFlight && !state.adapterInFlight);
+  if (persist) saveLocalState();
+  if (preview && state.video) {
+    scheduleAutoPreview({ delay: 250, reason: `${engineLabels[engine]} selected` });
+  }
+}
+
 function collectSettings() {
   const selectedScale = els.scaleBy.value;
   const presetLongestSide = resolutionPresets[selectedScale] ?? null;
@@ -344,7 +717,7 @@ function collectSettings() {
     els.stride.value = String(stride);
   }
   return {
-    engine: "hypir",
+    engine: state.engine,
     prompt: els.prompt.value,
     scaleBy,
     upscale: Number(els.upscale.value),
@@ -352,8 +725,17 @@ function collectSettings() {
     patchSize,
     stride,
     temporalConsistency: els.temporalConsistency.value,
-    adapterId: els.adapterSelect.value,
-    secondPass: els.secondPass.value,
+    adapterId: state.engine === "hypir" ? els.adapterSelect.value : "base",
+    secondPass: state.engine === "hypir" ? els.secondPass.value : "off",
+    seedvr2BatchSize: Number(els.seedvr2BatchSize.value),
+    seedvr2TemporalOverlap: Number(els.seedvr2TemporalOverlap.value),
+    seedvr2ChunkSize: Number(els.seedvr2ChunkSize.value),
+    seedvr2ColorCorrection: els.seedvr2ColorCorrection.value,
+    seedvr2PreviewSize: Number(els.seedvr2PreviewSize.value),
+    flashvsrVariant: els.flashvsrVariant.value,
+    flashvsrSparseRatio: Number(els.flashvsrSparseRatio.value),
+    flashvsrLocalRange: Number(els.flashvsrLocalRange.value),
+    flashvsrPreviewCap: Number(els.flashvsrPreviewCap.value),
     seed: Number(els.seed.value),
     device: "cuda",
   };
@@ -369,6 +751,9 @@ function updateScaleMode() {
 
 function resetGeneratedUi() {
   clearFramePlayback();
+  stopReadyPlayback();
+  state.readyFrameEvents = [];
+  state.readyFrameSeqs = new Set();
   state.currentJobId = null;
   state.partialExportInFlight = false;
   state.lastExportFramesDone = 0;
@@ -383,20 +768,22 @@ function resetGeneratedUi() {
   els.originalPreview.removeAttribute("src");
   els.enhancedPreview.hidden = true;
   els.enhancedPreview.removeAttribute("src");
-  els.enhancedEmpty.hidden = false;
   if (state.video) {
-    els.sourceVideo.hidden = false;
+    showSourceVideo();
     els.originalEmpty.hidden = true;
   } else {
     els.sourceVideo.hidden = true;
     els.originalEmpty.hidden = false;
+    els.enhancedEmpty.hidden = true;
+    updateComparisonVisibility();
   }
   els.originalInfo.textContent = "source frame";
-  els.enhancedInfo.textContent = "HYPIR preview";
+  els.enhancedInfo.textContent = enhancedInfoLabel();
   els.frameProgressText.textContent = "Frames: --";
   els.etaText.textContent = "ETA: --";
   els.jobProgress.style.width = "0%";
   updatePartialExportButton();
+  updateReadyPlaybackButton();
 }
 
 function setVideo(record, { persist = true } = {}) {
@@ -407,11 +794,10 @@ function setVideo(record, { persist = true } = {}) {
   els.videoName.textContent = record.name;
   els.videoMeta.textContent = `${meta.width}x${meta.height} | ${meta.fps.toFixed(3)} fps | ${formatTime(meta.duration)} | ${meta.codec || "video"}`;
   els.sourceVideo.src = record.url;
-  els.sourceVideo.hidden = false;
+  showSourceVideo();
   els.originalPreview.hidden = true;
-  els.originalEmpty.hidden = true;
   els.enhancedPreview.hidden = true;
-  els.enhancedEmpty.hidden = false;
+  updateComparisonVisibility();
   els.timeline.max = String(meta.duration || 0);
   els.timeline.value = "0";
   els.currentTime.textContent = formatTime(0);
@@ -425,7 +811,12 @@ function setVideo(record, { persist = true } = {}) {
   state.partialExportInFlight = false;
   state.lastExportFramesDone = 0;
   state.lastExportFramesTotal = 0;
+  stopReadyPlayback();
+  state.readyFrameEvents = [];
+  state.readyFrameSeqs = new Set();
+  updateReadyPlaybackButton();
   updatePartialExportButton();
+  updateEngineSpeedLabels();
   if (persist) saveLocalState();
   setActivity("Preparing preview", 0.1);
   scheduleAutoPreview({ delay: 200, reason: "new video" });
@@ -438,7 +829,7 @@ async function restoreSession() {
   } catch (error) {
     setActivity(`Could not load film adapters: ${error.message}`, 0);
   }
-  applySavedSettings(saved.settings);
+  applySavedSettings(saved.settings, { restoreEngine: saved.version === settingsStorageVersion });
   let restoredVideo = false;
   try {
     if (saved.videoId) {
@@ -543,10 +934,24 @@ function resumeAdapterJob(job) {
 async function refreshStatus() {
   try {
     const status = await api("/api/status");
-    const gpu = status.hypir.gpu || "no cuda";
-    els.gpuStatus.textContent = status.hypir.cudaAvailable ? gpu.replace("NVIDIA GeForce ", "") : "none";
+    state.status = status;
+    const selectedStatus = engineStatus();
+    const gpu = selectedStatus?.gpu || status.hypir.gpu || status.flashvsr?.gpu || "no cuda";
+    els.gpuStatus.textContent = (selectedStatus?.cudaAvailable ?? status.hypir.cudaAvailable)
+      ? gpu.replace("NVIDIA GeForce ", "")
+      : "none";
     els.nvencStatus.textContent = status.nvenc ? "ready" : "missing";
-    els.modelStatus.textContent = status.hypir.loaded ? "loaded" : "cold";
+    if (!isEngineAvailable()) {
+      els.modelStatus.textContent = "blocked";
+    } else if (selectedStatus?.loaded) {
+      els.modelStatus.textContent = "loaded";
+    } else if (selectedStatus?.available) {
+      els.modelStatus.textContent = "ready";
+    } else {
+      els.modelStatus.textContent = "cold";
+    }
+    updateEngineUi();
+    setExportEnabled(!state.exportInFlight && !state.previewInFlight && !state.adapterInFlight);
   } catch (error) {
     els.gpuStatus.textContent = "error";
     els.nvencStatus.textContent = "error";
@@ -566,12 +971,19 @@ async function uploadVideo(file) {
 }
 
 function setExportEnabled(enabled) {
-  els.exportButton.disabled = !enabled || !state.video || state.exportInFlight || state.previewInFlight;
+  const engineReady = isEngineAvailable();
+  const hypirSelected = state.engine === "hypir";
+  els.previewButton.hidden = true;
+  els.previewButton.disabled = true;
+  els.exportButton.disabled = !enabled || !state.video || state.exportInFlight || state.previewInFlight || !engineReady;
   els.cancelExportButton.hidden = !state.exportInFlight;
   els.cancelExportButton.disabled = !state.exportInFlight;
-  els.trainAdapterButton.disabled = !enabled || !state.video || state.exportInFlight || state.previewInFlight || state.adapterInFlight;
+  els.trainAdapterButton.disabled = !enabled || !state.video || state.exportInFlight || state.previewInFlight || state.adapterInFlight || !hypirSelected;
   els.cancelAdapterButton.hidden = !state.adapterInFlight;
   els.cancelAdapterButton.disabled = !state.adapterInFlight;
+  els.adapterSelect.disabled = !hypirSelected || state.exportInFlight || state.previewInFlight || state.adapterInFlight;
+  els.secondPass.disabled = !hypirSelected || state.exportInFlight || state.previewInFlight || state.adapterInFlight;
+  els.adapterQuality.disabled = !hypirSelected || state.exportInFlight || state.previewInFlight || state.adapterInFlight;
   els.clearGeneratedButton.disabled = (
     state.exportInFlight
     || state.previewInFlight
@@ -580,6 +992,8 @@ function setExportEnabled(enabled) {
   );
   updatePartialExportButton();
   updateDeleteAdapterButton();
+  updateEngineUi();
+  updateReadyPlaybackButton();
 }
 
 function updatePartialExportButton() {
@@ -590,8 +1004,9 @@ function updatePartialExportButton() {
     && state.currentJobId
     && readyFrames > 0
     && !state.partialExportInFlight
+    && state.engine === "hypir"
   );
-  els.partialExportButton.hidden = !state.exportInFlight;
+  els.partialExportButton.hidden = !state.exportInFlight || state.engine !== "hypir";
   els.partialExportButton.disabled = !canSave;
   if (state.partialExportInFlight) {
     els.partialExportButton.title = "Saving partial video";
@@ -605,21 +1020,51 @@ function updatePartialExportButton() {
 
 function scheduleAutoPreview({ delay = 450, reason = "settings changed" } = {}) {
   if (!state.video || state.exportInFlight) return;
+  if (!isEngineAvailable()) {
+    updateEngineUi();
+    return;
+  }
+  if (state.previewInFlight && state.engine !== "hypir") {
+    cancelActivePreviewRequest();
+  }
+  const selectedLabel = engineLabels[state.engine] || state.engine;
+  const effectiveDelay = state.engine === "hypir" ? delay : Math.max(delay, 650);
   state.previewDirty = true;
   window.clearTimeout(state.previewTimer);
-  setActivity(`Preview queued: ${reason}`, 0.12);
-  state.previewTimer = window.setTimeout(runAutoPreview, delay);
+  setActivity(`${selectedLabel} preview queued: ${reason}`, 0.12);
+  state.previewTimer = window.setTimeout(() => {
+    state.previewTimer = null;
+    runAutoPreview();
+  }, effectiveDelay);
 }
 
-async function runAutoPreview() {
+async function runAutoPreview({ manual = false } = {}) {
   if (!state.video) return;
-  if (state.previewInFlight) return;
+  if (state.previewInFlight) {
+    if (state.engine === "hypir" && !manual) return;
+    cancelActivePreviewRequest();
+  }
+  if (!isEngineAvailable()) {
+    updateEngineUi();
+    return;
+  }
   state.previewDirty = false;
   state.previewInFlight = true;
   setExportEnabled(false);
   const version = ++state.previewVersion;
-  setActivity("Enhancing preview", 0.2);
+  const selectedLabel = engineLabels[state.engine] || state.engine;
+  setActivity(state.engine === "hypir" ? "Enhancing preview" : `Running ${selectedLabel} preview`, 0.2);
+  let timedOut = false;
+  let timeoutId = null;
   try {
+    const controller = new AbortController();
+    state.previewController = controller;
+    const timeoutMs = previewTimeoutMsByEngine[state.engine] || 2 * 60 * 1000;
+    timeoutId = window.setTimeout(() => {
+      timedOut = true;
+      controller.abort();
+      fetch("/api/preview/cancel", { method: "POST" }).catch(() => {});
+    }, timeoutMs);
     const body = {
       videoId: state.video.id,
       seconds: Number(els.timeline.value),
@@ -629,27 +1074,42 @@ async function runAutoPreview() {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(body),
+      signal: controller.signal,
     });
     if (version !== state.previewVersion || state.previewDirty) return;
-    els.sourceVideo.hidden = true;
-    els.originalPreview.src = `${preview.originalUrl}?t=${Date.now()}`;
-    els.enhancedPreview.src = `${preview.enhancedUrl}?t=${Date.now()}`;
-    els.originalPreview.hidden = false;
-    els.enhancedPreview.hidden = false;
-    els.originalEmpty.hidden = true;
-    els.enhancedEmpty.hidden = true;
-    els.originalInfo.textContent = formatTime(preview.seconds);
     const passText = preview.passes === 2 ? " | 2 passes" : "";
-    els.enhancedInfo.textContent = `${preview.result.width}x${preview.result.height} | seed ${preview.result.seed}${passText}`;
+    const modeText = String(preview.result.previewMode || "").endsWith("_safe") ? " | safe preview" : "";
+    const clipText = preview.result.clipSeconds ? ` | ${preview.result.clipSeconds}s clip` : "";
+    showFramePair({
+      originalUrl: `${preview.originalUrl}?t=${Date.now()}`,
+      enhancedUrl: `${preview.enhancedUrl}?t=${Date.now()}`,
+      originalInfo: formatTime(preview.seconds),
+      enhancedInfo: `${preview.result.width}x${preview.result.height}${modeText}${clipText} | seed ${preview.result.seed}${passText}`,
+    });
+    rememberEngineMetric(state.engine, {
+      averageFrameSeconds: preview.result.averageFrameSeconds,
+      resolution: preview.result.metricResolution || `${preview.result.width}x${preview.result.height}`,
+      source: "preview",
+    });
     setActivity("Preview ready", 1);
     await refreshStatus();
   } catch (error) {
-    setActivity(`Preview failed: ${error.message}`, 0);
+    if (timedOut && version === state.previewVersion) {
+      setActivity("Preview timed out and was cancelled", 0);
+    } else if (error.name !== "AbortError" && !String(error.message || "").toLowerCase().includes("cancelled")) {
+      setActivity(`Preview failed: ${error.message}`, 0);
+    }
   } finally {
-    state.previewInFlight = false;
-    setExportEnabled(true);
-    if (state.previewDirty && !state.exportInFlight) {
-      scheduleAutoPreview({ delay: 50, reason: "latest change" });
+    if (timeoutId !== null) {
+      window.clearTimeout(timeoutId);
+    }
+    if (version === state.previewVersion) {
+      state.previewInFlight = false;
+      state.previewController = null;
+      setExportEnabled(true);
+      if (state.previewDirty && !state.exportInFlight) {
+        scheduleAutoPreview({ delay: 50, reason: "latest change" });
+      }
     }
   }
 }
@@ -657,13 +1117,20 @@ async function runAutoPreview() {
 async function startExport() {
   if (!state.video) return;
   window.clearTimeout(state.previewTimer);
+  if (state.previewInFlight) {
+    cancelActivePreviewRequest();
+  }
   clearFramePlayback();
+  stopReadyPlayback();
+  state.readyFrameEvents = [];
+  state.readyFrameSeqs = new Set();
   state.exportInFlight = true;
   state.partialExportInFlight = false;
   state.lastExportFramesDone = 0;
   state.lastExportFramesTotal = 0;
   state.previewDirty = false;
   setExportEnabled(false);
+  updateReadyPlaybackButton();
   saveLocalState();
   els.downloadLink.hidden = true;
   els.partialDownloadLink.hidden = true;
@@ -894,28 +1361,18 @@ function displayFrameEvent(frame) {
   const cacheBust = `?job=${encodeURIComponent(state.currentJobId || "")}&frame=${frame.seq}`;
   const originalUrl = `${frame.originalUrl}${cacheBust}`;
   const enhancedUrl = `${frame.enhancedUrl}${cacheBust}`;
-  if (state.liveOriginalUrl !== originalUrl) {
-    els.originalPreview.src = originalUrl;
-    state.liveOriginalUrl = originalUrl;
-  }
-  if (state.liveEnhancedUrl !== enhancedUrl) {
-    els.enhancedPreview.src = enhancedUrl;
-    state.liveEnhancedUrl = enhancedUrl;
-  }
-
-  els.sourceVideo.hidden = true;
-  els.originalPreview.hidden = false;
-  els.enhancedPreview.hidden = false;
-  els.originalEmpty.hidden = true;
-  els.enhancedEmpty.hidden = true;
   if (Number.isFinite(frame.seconds)) {
     els.timeline.value = String(frame.seconds);
     els.currentTime.textContent = formatTime(frame.seconds);
   }
-  els.originalInfo.textContent = `frame ${frame.frameIndex} | ${formatTime(frame.seconds)}`;
-  els.enhancedInfo.textContent = frame.cached
-    ? `frame ${frame.frameIndex} / ${frame.framesTotal} | cached`
-    : `frame ${frame.frameIndex} / ${frame.framesTotal} | generated`;
+  showFramePair({
+    originalUrl,
+    enhancedUrl,
+    originalInfo: `frame ${frame.frameIndex} | ${formatTime(frame.seconds)}`,
+    enhancedInfo: frame.cached
+      ? `frame ${frame.frameIndex} / ${frame.framesTotal} | cached`
+      : `frame ${frame.frameIndex} / ${frame.framesTotal} | generated`,
+  });
   state.lastDisplayedFrameSeq = frame.seq;
 }
 
@@ -942,6 +1399,7 @@ async function fetchFrameEvents(jobId, { allowInactive = false } = {}) {
     if (!allowInactive && jobId !== state.currentJobId) return false;
     if (result.frames?.length) {
       state.frameEventsAfter = result.nextAfter;
+      rememberReadyFrames(result.frames);
       state.frameEventQueue.push(...result.frames);
       playFrameQueue();
     }
@@ -970,33 +1428,27 @@ function updateLiveFrame(job) {
   if (!job.currentOriginalUrl || !job.currentEnhancedUrl) return;
   const originalUrl = `${job.currentOriginalUrl}?t=${job.updatedAt}`;
   const enhancedUrl = `${job.currentEnhancedUrl}?t=${job.updatedAt}`;
-  if (state.liveOriginalUrl !== originalUrl) {
-    els.originalPreview.src = originalUrl;
-    state.liveOriginalUrl = originalUrl;
-  }
-  if (state.liveEnhancedUrl !== enhancedUrl) {
-    els.enhancedPreview.src = enhancedUrl;
-    state.liveEnhancedUrl = enhancedUrl;
-  }
-  els.sourceVideo.hidden = true;
-  els.originalPreview.hidden = false;
-  els.enhancedPreview.hidden = false;
-  els.originalEmpty.hidden = true;
-  els.enhancedEmpty.hidden = true;
   if (Number.isFinite(job.currentFrameSeconds)) {
     els.timeline.value = String(job.currentFrameSeconds);
     els.currentTime.textContent = formatTime(job.currentFrameSeconds);
   }
-  els.originalInfo.textContent = job.currentFrameIndex
-    ? `frame ${job.currentFrameIndex}`
-    : "source frame";
-  els.enhancedInfo.textContent = job.framesTotal
-    ? `frame ${job.currentFrameIndex} / ${job.framesTotal}`
-    : "enhanced frame";
+  showFramePair({
+    originalUrl,
+    enhancedUrl,
+    originalInfo: job.currentFrameIndex ? `frame ${job.currentFrameIndex}` : "source frame",
+    enhancedInfo: job.framesTotal ? `frame ${job.currentFrameIndex} / ${job.framesTotal}` : "enhanced frame",
+  });
 }
 
 function updateJobUi(job) {
   setActivity(job.message, job.progress);
+  if (job.averageFrameSeconds) {
+    rememberEngineMetric(job.engine || state.engine, {
+      averageFrameSeconds: job.averageFrameSeconds,
+      resolution: job.metricResolution,
+      source: job.metricSource || "export",
+    });
+  }
   state.lastExportFramesDone = Number(job.partialFramesReady ?? job.framesDone) || 0;
   state.lastExportFramesTotal = Number(job.framesTotal) || 0;
   updatePartialExportButton();
@@ -1144,6 +1596,8 @@ els.sourceVideo.addEventListener("seeked", () => {
 });
 
 els.exportButton.addEventListener("click", startExport);
+els.previewButton.addEventListener("click", () => runAutoPreview({ manual: true }));
+els.playReadyButton.addEventListener("click", toggleReadyPlayback);
 els.cancelExportButton.addEventListener("click", cancelExport);
 els.partialExportButton.addEventListener("click", savePartialExport);
 els.trainAdapterButton.addEventListener("click", startAdapterTraining);
@@ -1153,6 +1607,13 @@ els.deleteAllAdaptersButton.addEventListener("click", deleteAllAdapters);
 els.openOutputFolderButton.addEventListener("click", openOutputFolder);
 els.clearGeneratedButton.addEventListener("click", clearGeneratedFiles);
 els.refreshStatusButton.addEventListener("click", refreshStatus);
+els.engineCards.forEach((card) => {
+  card.addEventListener("click", () => {
+    const engine = card.dataset.engine;
+    if (!engine || card.classList.contains("disabled")) return;
+    setEngine(engine);
+  });
+});
 els.scaleBy.addEventListener("change", () => {
   updateScaleMode();
   saveLocalState();
@@ -1195,13 +1656,46 @@ els.prompt.addEventListener("input", () => {
   saveLocalState();
   scheduleAutoPreview();
 });
+[
+  els.seedvr2BatchSize,
+  els.seedvr2TemporalOverlap,
+  els.seedvr2ChunkSize,
+  els.seedvr2ColorCorrection,
+  els.seedvr2PreviewSize,
+  els.flashvsrVariant,
+  els.flashvsrSparseRatio,
+  els.flashvsrLocalRange,
+  els.flashvsrPreviewCap,
+].forEach((element) => {
+  element.addEventListener("change", () => {
+    saveLocalState();
+    scheduleAutoPreview();
+  });
+});
 els.encoder.addEventListener("change", saveLocalState);
 els.crf.addEventListener("input", () => {
   els.crfValue.textContent = els.crf.value;
   saveLocalState();
 });
 
+els.comparisonBox.addEventListener("pointerdown", beginComparisonDrag);
+window.addEventListener("pointermove", moveComparisonDrag);
+window.addEventListener("pointerup", endComparisonDrag);
+els.comparisonHandle.addEventListener("keydown", (event) => {
+  if (!els.comparisonBox.classList.contains("comparison-active")) return;
+  if (event.key === "ArrowLeft") {
+    event.preventDefault();
+    setComparisonPosition(comparisonPosition() - 3);
+  }
+  if (event.key === "ArrowRight") {
+    event.preventDefault();
+    setComparisonPosition(comparisonPosition() + 3);
+  }
+});
+
+state.engineMetrics = readEngineMetrics();
 updateScaleMode();
 setupTooltips();
+resetGeneratedUi();
 refreshStatus();
 restoreSession();

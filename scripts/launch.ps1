@@ -10,14 +10,19 @@ $ErrorActionPreference = "Stop"
 $Root = Split-Path -Parent (Split-Path -Parent $MyInvocation.MyCommand.Path)
 $Python = Join-Path $Root ".venv\Scripts\python.exe"
 $Url = "http://127.0.0.1:$Port"
-$OpenUrl = "$Url/?v=2026-06-12-partial-export-v4"
+$OpenUrl = "$Url/?v=2026-06-15-seedvr2-flashvsr-wsl-v15"
+$HealthUrl = "$Url/api/health"
 $StatusUrl = "$Url/api/status"
 
 function Get-CleanVideoStatus {
     try {
-        return Invoke-RestMethod -Uri $StatusUrl -TimeoutSec 2
+        return Invoke-RestMethod -Uri $HealthUrl -TimeoutSec 5
     } catch {
-        return $null
+        try {
+            return Invoke-RestMethod -Uri $StatusUrl -TimeoutSec 15
+        } catch {
+            return $null
+        }
     }
 }
 
@@ -38,6 +43,40 @@ function Get-PortProcessIds {
     } catch {
         return @()
     }
+}
+
+function Get-PortProcesses {
+    $processes = @()
+    foreach ($processId in Get-PortProcessIds) {
+        if ($processId -gt 0) {
+            $process = Get-CimInstance Win32_Process -Filter "ProcessId = $processId" -ErrorAction SilentlyContinue
+            if ($null -ne $process) {
+                $processes += $process
+            }
+        }
+    }
+    return $processes
+}
+
+function Test-PortOwnedByCleanVideo {
+    foreach ($process in Get-PortProcesses) {
+        if (($process.CommandLine -match "uvicorn\s+app\.main:app") -or ($process.ExecutablePath -like "$Root*")) {
+            return $true
+        }
+    }
+    return $false
+}
+
+function Get-PortOwnerSummary {
+    $owners = @()
+    foreach ($process in Get-PortProcesses) {
+        $commandLine = if ($process.CommandLine) { $process.CommandLine } else { $process.ExecutablePath }
+        $owners += "PID $($process.ProcessId): $commandLine"
+    }
+    if ($owners.Count -eq 0) {
+        return "unknown owner"
+    }
+    return ($owners -join "; ")
 }
 
 function Stop-PortProcesses {
@@ -81,7 +120,18 @@ if ($isCleanVideo -and ($Restart -or $RestartWhenIdle)) {
 
 if (!$isCleanVideo) {
     if (Test-PortListening) {
-        throw "Port $Port is already in use, but CleanVideo is not responding at $StatusUrl."
+        if (($Restart -or $RestartWhenIdle) -and (Test-PortOwnedByCleanVideo)) {
+            Write-Host "Port $Port is held by a stale CleanVideo process; stopping it before restart..."
+            Stop-PortProcesses
+        } else {
+            $owners = Get-PortOwnerSummary
+            throw "Port $Port is already in use, but CleanVideo is not responding at $HealthUrl or $StatusUrl. Owner: $owners"
+        }
+    }
+
+    if (Test-PortListening) {
+        $owners = Get-PortOwnerSummary
+        throw "Port $Port is still in use after cleanup. Owner: $owners"
     }
 
     Start-Process `
