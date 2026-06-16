@@ -10,7 +10,7 @@ $ErrorActionPreference = "Stop"
 $Root = Split-Path -Parent (Split-Path -Parent $MyInvocation.MyCommand.Path)
 $Python = Join-Path $Root ".venv\Scripts\python.exe"
 $Url = "http://127.0.0.1:$Port"
-$OpenUrl = "$Url/?v=2026-06-16-flashvsr-resume-v16"
+$OpenUrl = "$Url/?v=2026-06-16-flashvsr-live-render-v19"
 $HealthUrl = "$Url/api/health"
 $StatusUrl = "$Url/api/status"
 

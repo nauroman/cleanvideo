@@ -1,5 +1,5 @@
 const defaultEngine = "flashvsr";
-const settingsStorageVersion = 2;
+const settingsStorageVersion = 3;
 const settingsStorageKey = "cleanvideo.session.v1";
 const engineMetricsStorageKey = "cleanvideo.engineMetrics.v1";
 const previewTimeoutMsByEngine = {

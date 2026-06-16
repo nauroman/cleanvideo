@@ -249,12 +249,57 @@ class StreamingLqFrameBuffer:
             self.base_index += drop
 
 
-def append_video_frames(writer, frames: torch.Tensor, remaining: int, total_frames: int, written: int) -> int:
+def tensor_video_to_uint8(frames: torch.Tensor) -> np.ndarray:
     frames = frames.detach().float().permute(1, 2, 3, 0)
-    frames = ((frames + 1) * 127.5).clip(0, 255).cpu().numpy().astype(np.uint8)
-    for frame in frames[:remaining]:
+    return ((frames + 1) * 127.5).clip(0, 255).cpu().numpy().astype(np.uint8)
+
+
+def save_live_frame_pair(
+    original_path: Path,
+    enhanced_path: Path,
+    original_frame: np.ndarray,
+    enhanced_frame: np.ndarray,
+    quality: int,
+) -> None:
+    original_path.parent.mkdir(parents=True, exist_ok=True)
+    enhanced_path.parent.mkdir(parents=True, exist_ok=True)
+    save_kwargs = {"quality": quality, "subsampling": 0}
+    Image.fromarray(original_frame).save(original_path, format="JPEG", **save_kwargs)
+    Image.fromarray(enhanced_frame).save(enhanced_path, format="JPEG", **save_kwargs)
+
+
+def append_video_frames(
+    writer,
+    frames: torch.Tensor,
+    original_frames: torch.Tensor,
+    remaining: int,
+    total_frames: int,
+    written: int,
+    *,
+    fps: float,
+    live_original: Path | None,
+    live_enhanced: Path | None,
+    live_quality: int,
+) -> int:
+    frames = tensor_video_to_uint8(frames)
+    original_frames = tensor_video_to_uint8(original_frames)
+    frame_count = min(len(frames), remaining)
+    for local_index, frame in enumerate(frames[:frame_count]):
         writer.append_data(frame)
         written += 1
+        if (
+            live_original is not None
+            and live_enhanced is not None
+            and (local_index == frame_count - 1 or written == total_frames)
+        ):
+            save_live_frame_pair(
+                live_original,
+                live_enhanced,
+                original_frames[local_index],
+                frame,
+                live_quality,
+            )
+            print(f"LIVE_FRAME {written} {total_frames} {(written - 1) / max(1.0, fps):.6f}", flush=True)
         if written == 1 or written == total_frames or written % 8 == 0:
             print(f"{written - 1} {total_frames}", flush=True)
     return written
@@ -264,7 +309,7 @@ def pipeline_module(pipe):
     return importlib.import_module(pipe.__class__.__module__)
 
 
-def stream_flashvsr_tiny_long(module, pipe, args) -> None:
+def stream_flashvsr_tiny(module, pipe, args) -> None:
     source = StreamingLqFrameBuffer(
         module,
         args.input.resolve(),
@@ -302,6 +347,7 @@ def stream_flashvsr_tiny_long(module, pipe, args) -> None:
     try:
         with torch.no_grad():
             for cur_process_idx in range(process_total_num):
+                pipe.load_models_to_device(["dit"])
                 if cur_process_idx == 0:
                     pre_cache_k = [None] * len(pipe.dit.blocks)
                     pre_cache_v = [None] * len(pipe.dit.blocks)
@@ -372,6 +418,9 @@ def stream_flashvsr_tiny_long(module, pipe, args) -> None:
                 )
 
                 cur_latents = cur_latents - noise_pred_posi
+                del noise_pred_posi, lq_latents
+                pipe.load_models_to_device([])
+                torch.cuda.empty_cache()
                 cur_lq_frame = source.slice(lq_pre_idx, lq_cur_idx).to(device)
                 cur_frames = pipe.TCDecoder.decode_video(
                     cur_latents.transpose(1, 2),
@@ -393,10 +442,21 @@ def stream_flashvsr_tiny_long(module, pipe, args) -> None:
 
                 remaining = source.source_frames - written
                 if remaining > 0:
-                    written = append_video_frames(writer, cur_frames[0], remaining, source.source_frames, written)
+                    written = append_video_frames(
+                        writer,
+                        cur_frames[0],
+                        cur_lq_frame[0],
+                        remaining,
+                        source.source_frames,
+                        written,
+                        fps=source.fps,
+                        live_original=args.live_original,
+                        live_enhanced=args.live_enhanced,
+                        live_quality=args.live_quality,
+                    )
                 lq_pre_idx = lq_cur_idx
                 source.discard_before(lq_pre_idx)
-                del cur_latents, noise_pred_posi, cur_lq_frame, cur_frames, lq_latents
+                del cur_latents, cur_lq_frame, cur_frames
                 torch.cuda.empty_cache()
 
         if written != source.source_frames:
@@ -419,6 +479,9 @@ def main() -> int:
     parser.add_argument("--total_frames", type=int, default=None)
     parser.add_argument("--fps", type=float, default=None)
     parser.add_argument("--streaming", action="store_true")
+    parser.add_argument("--live_original", type=Path, default=None)
+    parser.add_argument("--live_enhanced", type=Path, default=None)
+    parser.add_argument("--live_quality", type=int, default=92)
     args = parser.parse_args()
 
     if not torch.cuda.is_available():
@@ -457,9 +520,9 @@ def main() -> int:
     torch.cuda.empty_cache()
     torch.cuda.ipc_collect()
     if args.streaming:
-        if args.variant != "tiny_long":
-            raise RuntimeError("FlashVSR streaming is currently supported only for the tiny_long variant.")
-        stream_flashvsr_tiny_long(module, pipe, args)
+        if args.variant not in {"tiny_long", "tiny"}:
+            raise RuntimeError("FlashVSR streaming is currently supported only for the tiny and tiny_long variants.")
+        stream_flashvsr_tiny(module, pipe, args)
         print(f"Done: {output_path}")
         return 0
 

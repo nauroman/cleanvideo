@@ -3,7 +3,12 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
-from app.flashvsr_engine import FlashVsrEngine, FlashVsrSettings, is_transient_import_corruption
+from app.flashvsr_engine import (
+    FlashVsrEngine,
+    FlashVsrSettings,
+    is_transient_import_corruption,
+    is_transient_torch_load_corruption,
+)
 
 
 class FakeFlashVsrProcess:
@@ -43,6 +48,18 @@ class FlashVsrEngineTests(unittest.TestCase):
         detail = "RuntimeError: CUDA out of memory while running FlashVSR"
 
         self.assertFalse(is_transient_import_corruption(detail))
+        self.assertFalse(is_transient_torch_load_corruption(detail))
+
+    def test_detects_torch_load_unpickler_corruption(self) -> None:
+        detail = """
+        File "/home/user/.cleanvideo/flashvsr-wsl/.venv/lib/python3.11/site-packages/torch/serialization.py", line 1964, in _load
+          result = unpickler.load()
+        File "/home/user/.cleanvideo/flashvsr-wsl/.venv/lib/python3.11/site-packages/torch/_weights_only_unpickler.py", line 517, in load
+          i = (read(1) if key[0] == BINPUT[0] else unpack("<I", read(4)))[0]
+        TypeError: 'str' object is not callable
+        """
+
+        self.assertTrue(is_transient_torch_load_corruption(detail))
 
     def test_retries_transient_import_corruption_once(self) -> None:
         with TemporaryDirectory() as temp_dir:
@@ -83,13 +100,15 @@ class FlashVsrEngineTests(unittest.TestCase):
             self.assertEqual(result["seed"], 231)
             self.assertEqual(attempts, 2)
             self.assertTrue(output_path.exists())
-            self.assertTrue(any("transient Python import corruption" in line for line in lines))
+            self.assertTrue(any("transient Python runtime corruption" in line for line in lines))
 
     def test_streaming_export_passes_frame_metadata_to_cli(self) -> None:
         with TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             input_path = root / "input.mp4"
             output_path = root / "output.mp4"
+            live_original_path = root / "live" / "latest_original.jpg"
+            live_enhanced_path = root / "live" / "latest_enhanced.jpg"
             input_path.write_bytes(b"input")
             captured_args: list[str] = []
 
@@ -108,6 +127,8 @@ class FlashVsrEngineTests(unittest.TestCase):
                     total_frames=123,
                     fps=23.976,
                     streaming=True,
+                    live_original_path=live_original_path,
+                    live_enhanced_path=live_enhanced_path,
                 )
 
             self.assertIn("--streaming", captured_args)
@@ -115,6 +136,10 @@ class FlashVsrEngineTests(unittest.TestCase):
             self.assertIn("123", captured_args)
             self.assertIn("--fps", captured_args)
             self.assertIn("23.976", captured_args)
+            self.assertIn("--live_original", captured_args)
+            self.assertIn(str(live_original_path), captured_args)
+            self.assertIn("--live_enhanced", captured_args)
+            self.assertIn(str(live_enhanced_path), captured_args)
 
 
 if __name__ == "__main__":

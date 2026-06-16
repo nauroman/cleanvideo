@@ -37,6 +37,19 @@ def is_transient_import_corruption(output: str) -> bool:
     )
 
 
+def is_transient_torch_load_corruption(output: str) -> bool:
+    normalized = output.replace("\\", "/")
+    return (
+        "torch/serialization.py" in normalized
+        and "torch/_weights_only_unpickler.py" in normalized
+        and "TypeError: 'str' object is not callable" in normalized
+    )
+
+
+def is_transient_flashvsr_worker_error(output: str) -> bool:
+    return is_transient_import_corruption(output) or is_transient_torch_load_corruption(output)
+
+
 class FlashVsrEngine:
     def __init__(self) -> None:
         self._status_cache: tuple[float, dict] | None = None
@@ -291,6 +304,8 @@ class FlashVsrEngine:
         total_frames: int | None = None,
         fps: float | None = None,
         streaming: bool = False,
+        live_original_path: Path | None = None,
+        live_enhanced_path: Path | None = None,
     ) -> dict:
         backend = self._active_backend()
         output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -320,6 +335,10 @@ class FlashVsrEngine:
                 args.extend(["--fps", str(float(fps))])
             if streaming:
                 args.append("--streaming")
+            if live_original_path is not None:
+                args.extend(["--live_original", self._wslpath(live_original_path)])
+            if live_enhanced_path is not None:
+                args.extend(["--live_enhanced", self._wslpath(live_enhanced_path)])
             env = os.environ.copy()
         else:
             args = [
@@ -347,6 +366,10 @@ class FlashVsrEngine:
                 args.extend(["--fps", str(float(fps))])
             if streaming:
                 args.append("--streaming")
+            if live_original_path is not None:
+                args.extend(["--live_original", str(live_original_path)])
+            if live_enhanced_path is not None:
+                args.extend(["--live_enhanced", str(live_enhanced_path)])
             env = self._env()
         for attempt in range(1, FLASHVSR_TRANSIENT_IMPORT_ATTEMPTS + 1):
             if attempt > 1:
@@ -415,10 +438,10 @@ class FlashVsrEngine:
                 break
 
             detail = "\n".join(output_tail[-10:])
-            if attempt < FLASHVSR_TRANSIENT_IMPORT_ATTEMPTS and is_transient_import_corruption(detail):
+            if attempt < FLASHVSR_TRANSIENT_IMPORT_ATTEMPTS and is_transient_flashvsr_worker_error(detail):
                 if on_line:
                     on_line(
-                        "FlashVSR hit transient Python import corruption; "
+                        "FlashVSR hit transient Python runtime corruption; "
                         f"retrying ({attempt + 1}/{FLASHVSR_TRANSIENT_IMPORT_ATTEMPTS})"
                     )
                 time.sleep(1.0)

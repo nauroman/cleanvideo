@@ -4,7 +4,7 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>CleanVideo</title>
-    <link rel="stylesheet" href="/styles.css?v=2026-06-16-ui-fit-v1" />
+    <link rel="stylesheet" href="/styles.css?v=2026-06-16-flashvsr-live-render-v19" />
   </head>
   <body>
     <main class="app-shell">
@@ -486,7 +486,7 @@
                 class="help-button"
                 type="button"
                 aria-label="FlashVSR Variant help"
-                data-tooltip="FlashVSR model script. Tiny Long is the current default for video. Tiny can be faster on short clips. Full is heavier and may exceed VRAM at high resolution."
+                data-tooltip="FlashVSR model script. Tiny Long is the current default for video. Tiny also streams final exports and can be useful for short comparisons. Full is heavier and still uses the fallback chunked export path."
               >?</button>
             </span>
             <select id="flashvsrVariant" aria-label="FlashVSR Variant">
@@ -578,6 +578,6 @@
         </section>
       </aside>
     </main>
-    <script src="/app.js?v=2026-06-16-flashvsr-resume-v16" type="module"></script>
+    <script src="/app.js?v=2026-06-16-flashvsr-live-render-v19" type="module"></script>
   </body>
 </html>

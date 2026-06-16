@@ -60,7 +60,7 @@ ADAPTER_DIR = WORK_DIR / "adapters"
 for directory in [UPLOAD_DIR, PREVIEW_DIR, EXPORT_DIR, JOB_DIR, CACHE_DIR, PARTIAL_DIR, ADAPTER_DIR]:
     directory.mkdir(parents=True, exist_ok=True)
 GENERATED_DIRS = [PREVIEW_DIR, CACHE_DIR, PARTIAL_DIR, JOB_DIR, EXPORT_DIR]
-APP_BUILD = "2026-06-16-flashvsr-resume-v16"
+APP_BUILD = "2026-06-16-flashvsr-live-render-v19"
 ADAPTER_TRAINING_RECOVERY_LIMIT = 3
 SEEDVR2_PREVIEW_DEFAULT_LONGEST_SIDE = 1280
 FLASHVSR_PREVIEW_DEFAULT_LONGEST_SIDE = 1280
@@ -69,12 +69,13 @@ FLASHVSR_PREVIEW_SAFE_MODEL_LONGEST_SIDE = 1920
 FLASHVSR_PREVIEW_TIMEOUT_SECONDS = 5 * 60
 FLASHVSR_EXPORT_CHUNK_FRAMES = 21
 FLASHVSR_FRAME_PROGRESS_RE = re.compile(r"^\s*(\d+)\s+(\d+)\s*$")
+FLASHVSR_LIVE_FRAME_RE = re.compile(r"^\s*LIVE_FRAME\s+(\d+)\s+(\d+)\s+([0-9.]+)\s*$")
 FLASHVSR_NATIVE_MIN_LONGEST_SIDE = 512
 EngineName = Literal["hypir", "seedvr2", "flashvsr"]
 ENGINE_VERSION = {
     "hypir": "hypir-sd2-v1",
     "seedvr2": "seedvr2-3b-fp8-cli-v1",
-    "flashvsr": "flashvsr-v1.1-streaming-tiny-long",
+    "flashvsr": "flashvsr-v1.1-streaming-live-v3",
 }
 
 AdapterQuality = Literal["fast", "high", "extra"]
@@ -969,6 +970,18 @@ def flashvsr_chunk_frames_done_from_line(line: str, frames_in_chunk: int) -> int
     if frame_index < 0 or frame_total <= 0 or frame_index >= frame_total:
         return None
     return min(frames_in_chunk, frame_index + 1)
+
+
+def flashvsr_live_frame_from_line(line: str, total_frames: int) -> tuple[int, float] | None:
+    match = FLASHVSR_LIVE_FRAME_RE.match(line)
+    if not match or total_frames <= 0:
+        return None
+    frame_index = int(match.group(1))
+    frame_total = int(match.group(2))
+    seconds = float(match.group(3))
+    if frame_index <= 0 or frame_total <= 0:
+        return None
+    return min(total_frames, frame_index), max(0.0, seconds)
 
 
 def open_local_folder(path: Path) -> None:
@@ -1915,8 +1928,14 @@ def run_native_video_export(job_id: str, request: ExportRequest) -> None:
                         max(0, total_frames - completed),
                     )
 
-                if request.flashvsrVariant == "tiny_long":
+                if request.flashvsrVariant in {"tiny_long", "tiny"}:
                     raw_output.unlink(missing_ok=True)
+                    live_root = cache_root / "flashvsr_live"
+                    live_root.mkdir(parents=True, exist_ok=True)
+                    live_original = live_root / "latest_original.jpg"
+                    live_enhanced = live_root / "latest_enhanced.jpg"
+                    live_original.unlink(missing_ok=True)
+                    live_enhanced.unlink(missing_ok=True)
                     update_job(
                         job_id,
                         progress=0.05,
@@ -1926,11 +1945,32 @@ def run_native_video_export(job_id: str, request: ExportRequest) -> None:
                         framesTotal=expected_count,
                         partialFramesReady=0,
                     )
+                    last_stream_done = {"frames": 0}
 
                     def on_stream_line(line: str) -> None:
                         if line:
                             with log_path.open("a", encoding="utf-8", errors="replace") as log:
                                 log.write(f"[stream] {line}\n")
+                        live_frame = flashvsr_live_frame_from_line(line, total_frames)
+                        if live_frame is not None:
+                            live_done, live_seconds = live_frame
+                            last_stream_done["frames"] = live_done
+                            stream_progress = min(0.88, 0.05 + 0.83 * (live_done / total_frames))
+                            progress_state["progress"] = stream_progress
+                            update_job(
+                                job_id,
+                                progress=stream_progress,
+                                message=f"FlashVSR streaming frame {live_done}/{total_frames}",
+                                etaSeconds=flashvsr_eta(live_done),
+                                framesDone=live_done,
+                                framesTotal=expected_count,
+                                partialFramesReady=0,
+                                currentFrameIndex=live_done,
+                                currentFrameSeconds=live_seconds,
+                                currentOriginalUrl=media_url(live_original) if live_original.exists() else None,
+                                currentEnhancedUrl=media_url(live_enhanced) if live_enhanced.exists() else None,
+                            )
+                            return
                         stream_done = flashvsr_chunk_frames_done_from_line(line, total_frames)
                         if stream_done is None:
                             progress_state["progress"] = min(0.88, progress_state["progress"] + 0.003)
@@ -1938,12 +1978,13 @@ def run_native_video_export(job_id: str, request: ExportRequest) -> None:
                                 job_id,
                                 progress=progress_state["progress"],
                                 message=f"FlashVSR streaming: {line[:100]}" if line else "FlashVSR streaming",
-                                framesDone=0,
+                                framesDone=last_stream_done["frames"],
                                 framesTotal=expected_count,
                                 partialFramesReady=0,
                             )
                             return
                         stream_progress = min(0.88, 0.05 + 0.83 * (stream_done / total_frames))
+                        last_stream_done["frames"] = stream_done
                         progress_state["progress"] = stream_progress
                         update_job(
                             job_id,
@@ -1963,6 +2004,8 @@ def run_native_video_export(job_id: str, request: ExportRequest) -> None:
                         total_frames=total_frames,
                         fps=fps,
                         streaming=True,
+                        live_original_path=live_original,
+                        live_enhanced_path=live_enhanced,
                         on_line=on_stream_line,
                         on_process=on_process,
                         should_cancel=should_cancel,
