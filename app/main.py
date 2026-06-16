@@ -38,8 +38,6 @@ from .resource_control import (
 from .seedvr2_engine import SeedVr2Settings, engine as seedvr2_engine
 from .temporal_stabilizer import TemporalConsistency, stabilize_frame, temporal_mode_enabled
 from .video_ops import (
-    concat_videos_copy,
-    create_video_chunk,
     encode_video,
     extract_frame,
     extract_frames,
@@ -47,7 +45,6 @@ from .video_ops import (
     probe_video,
     remux_video_with_source_audio,
     safe_name,
-    trim_video_frame_count,
 )
 
 
@@ -78,7 +75,6 @@ FLASHVSR_PREVIEW_DEFAULT_LONGEST_SIDE = 1280
 FLASHVSR_PREVIEW_FRAMES = 21
 FLASHVSR_PREVIEW_SAFE_MODEL_LONGEST_SIDE = 1920
 FLASHVSR_PREVIEW_TIMEOUT_SECONDS = 5 * 60
-FLASHVSR_EXPORT_CHUNK_FRAMES = 21
 FLASHVSR_FRAME_PROGRESS_RE = re.compile(r"^\s*(\d+)\s+(\d+)\s*$")
 FLASHVSR_LIVE_FRAME_RE = re.compile(r"^\s*LIVE_FRAME\s+(\d+)\s+(\d+)\s+([0-9.]+)\s*$")
 FLASHVSR_NATIVE_MIN_LONGEST_SIDE = 512
@@ -883,6 +879,12 @@ def flashvsr_native_pixel_budget(total_vram_mb: int | None) -> int:
 
 
 def flashvsr_native_export_blocker(metadata: dict, request: ExportRequest) -> str | None:
+    if request.flashvsrVariant not in {"tiny_long", "tiny"}:
+        return (
+            "FlashVSR render/export is available only through the continuous streaming Tiny Long or Tiny paths. "
+            "The Full variant would require chunked render, which is disabled because it breaks final render quality."
+        )
+
     source_width = int(metadata.get("width") or 0)
     source_height = int(metadata.get("height") or 0)
     source_longest = max(source_width, source_height)
@@ -945,10 +947,6 @@ def partial_output_path(record: dict, cache_key: str, frame_count: int, request:
     return EXPORT_DIR / safe_name(output_name)
 
 
-def flashvsr_chunk_output_path(cache_root: Path, chunk_index: int) -> Path:
-    return cache_root / "flashvsr_output_chunks" / f"chunk_{chunk_index:05d}.mp4"
-
-
 def write_cache_manifest(cache_root: Path, record: dict, request: ExportRequest, status: str) -> None:
     manifest = {
         "status": status,
@@ -991,27 +989,6 @@ def contiguous_ready_frames(frames_dir: Path) -> list[Path]:
     return frames
 
 
-def contiguous_flashvsr_chunks(cache_root: Path, total_frames: int) -> tuple[list[Path], int]:
-    total_frames = max(0, int(total_frames))
-    if total_frames <= 0:
-        return [], 0
-
-    chunks: list[Path] = []
-    frames_ready = 0
-    total_chunks = math.ceil(total_frames / FLASHVSR_EXPORT_CHUNK_FRAMES)
-    for chunk_index in range(1, total_chunks + 1):
-        start_frame = (chunk_index - 1) * FLASHVSR_EXPORT_CHUNK_FRAMES
-        frames_in_chunk = min(FLASHVSR_EXPORT_CHUNK_FRAMES, total_frames - start_frame)
-        if frames_in_chunk <= 0:
-            break
-        chunk_output = flashvsr_chunk_output_path(cache_root, chunk_index)
-        if not reusable_video_file(chunk_output, frames_in_chunk):
-            break
-        chunks.append(chunk_output)
-        frames_ready += frames_in_chunk
-    return chunks, frames_ready
-
-
 def snapshot_partial_frames(frames: list[Path], target_dir: Path) -> None:
     target_dir.mkdir(parents=True, exist_ok=True)
     for index, frame_path in enumerate(frames, start=1):
@@ -1033,15 +1010,15 @@ def eta_seconds(generation_elapsed: float, completed_misses: int, remaining_miss
     return elapsed / completed_misses * remaining_misses
 
 
-def flashvsr_chunk_frames_done_from_line(line: str, frames_in_chunk: int) -> int | None:
+def flashvsr_progress_frames_done_from_line(line: str, total_frames: int) -> int | None:
     match = FLASHVSR_FRAME_PROGRESS_RE.match(line)
-    if not match or frames_in_chunk <= 0:
+    if not match or total_frames <= 0:
         return None
     frame_index = int(match.group(1))
     frame_total = int(match.group(2))
     if frame_index < 0 or frame_total <= 0 or frame_index >= frame_total:
         return None
-    return min(frames_in_chunk, frame_index + 1)
+    return min(total_frames, frame_index + 1)
 
 
 def flashvsr_live_frame_from_line(line: str, total_frames: int) -> tuple[int, float] | None:
@@ -2118,221 +2095,98 @@ def run_native_video_export(job_id: str, request: ExportRequest) -> None:
                         max(0, total_frames - completed),
                     )
 
-                if request.flashvsrVariant in {"tiny_long", "tiny"}:
-                    raw_output.unlink(missing_ok=True)
-                    live_root = cache_root / "flashvsr_live"
-                    live_root.mkdir(parents=True, exist_ok=True)
-                    live_original = live_root / "latest_original.jpg"
-                    live_enhanced = live_root / "latest_enhanced.jpg"
-                    live_original.unlink(missing_ok=True)
-                    live_enhanced.unlink(missing_ok=True)
-                    update_job(
-                        job_id,
-                        progress=0.05,
-                        message="FlashVSR streaming export",
-                        etaSeconds=None,
-                        framesDone=0,
-                        framesTotal=expected_count,
-                        partialFramesReady=0,
-                    )
-                    last_stream_done = {"frames": 0}
+                raw_output.unlink(missing_ok=True)
+                live_root = cache_root / "flashvsr_live"
+                live_root.mkdir(parents=True, exist_ok=True)
+                live_original = live_root / "latest_original.jpg"
+                live_enhanced = live_root / "latest_enhanced.jpg"
+                live_original.unlink(missing_ok=True)
+                live_enhanced.unlink(missing_ok=True)
+                update_job(
+                    job_id,
+                    progress=0.05,
+                    message="FlashVSR streaming export",
+                    etaSeconds=None,
+                    framesDone=0,
+                    framesTotal=expected_count,
+                    partialFramesReady=0,
+                )
+                last_stream_done = {"frames": 0}
 
-                    def on_stream_line(line: str) -> None:
-                        if line:
-                            with log_path.open("a", encoding="utf-8", errors="replace") as log:
-                                log.write(f"[stream] {line}\n")
-                        live_frame = flashvsr_live_frame_from_line(line, total_frames)
-                        if live_frame is not None:
-                            live_done, live_seconds = live_frame
-                            last_stream_done["frames"] = live_done
-                            stream_progress = min(0.88, 0.05 + 0.83 * (live_done / total_frames))
-                            progress_state["progress"] = stream_progress
-                            update_job(
-                                job_id,
-                                progress=stream_progress,
-                                message=f"FlashVSR streaming frame {live_done}/{total_frames}",
-                                etaSeconds=flashvsr_eta(live_done),
-                                framesDone=live_done,
-                                framesTotal=expected_count,
-                                partialFramesReady=0,
-                                currentFrameIndex=live_done,
-                                currentFrameSeconds=live_seconds,
-                                currentOriginalUrl=media_url(live_original) if live_original.exists() else None,
-                                currentEnhancedUrl=media_url(live_enhanced) if live_enhanced.exists() else None,
-                            )
-                            return
-                        stream_done = flashvsr_chunk_frames_done_from_line(line, total_frames)
-                        if stream_done is None:
-                            progress_state["progress"] = min(0.88, progress_state["progress"] + 0.003)
-                            update_job(
-                                job_id,
-                                progress=progress_state["progress"],
-                                message=f"FlashVSR streaming: {line[:100]}" if line else "FlashVSR streaming",
-                                framesDone=last_stream_done["frames"],
-                                framesTotal=expected_count,
-                                partialFramesReady=0,
-                            )
-                            return
-                        stream_progress = min(0.88, 0.05 + 0.83 * (stream_done / total_frames))
-                        last_stream_done["frames"] = stream_done
+                def on_stream_line(line: str) -> None:
+                    if line:
+                        with log_path.open("a", encoding="utf-8", errors="replace") as log:
+                            log.write(f"[stream] {line}\n")
+                    live_frame = flashvsr_live_frame_from_line(line, total_frames)
+                    if live_frame is not None:
+                        live_done, live_seconds = live_frame
+                        last_stream_done["frames"] = live_done
+                        stream_progress = min(0.88, 0.05 + 0.83 * (live_done / total_frames))
                         progress_state["progress"] = stream_progress
                         update_job(
                             job_id,
                             progress=stream_progress,
-                            message=f"FlashVSR streaming frame {stream_done}/{total_frames}",
-                            etaSeconds=flashvsr_eta(stream_done),
-                            framesDone=stream_done,
+                            message=f"FlashVSR streaming frame {live_done}/{total_frames}",
+                            etaSeconds=flashvsr_eta(live_done),
+                            framesDone=live_done,
+                            framesTotal=expected_count,
+                            partialFramesReady=0,
+                            currentFrameIndex=live_done,
+                            currentFrameSeconds=live_seconds,
+                            currentOriginalUrl=media_url(live_original) if live_original.exists() else None,
+                            currentEnhancedUrl=media_url(live_enhanced) if live_enhanced.exists() else None,
+                        )
+                        return
+                    stream_done = flashvsr_progress_frames_done_from_line(line, total_frames)
+                    if stream_done is None:
+                        progress_state["progress"] = min(0.88, progress_state["progress"] + 0.003)
+                        update_job(
+                            job_id,
+                            progress=progress_state["progress"],
+                            message=f"FlashVSR streaming: {line[:100]}" if line else "FlashVSR streaming",
+                            framesDone=last_stream_done["frames"],
                             framesTotal=expected_count,
                             partialFramesReady=0,
                         )
-
-                    flashvsr_engine.enhance_video(
-                        source,
-                        raw_output,
-                        flash_settings,
-                        source_longest_side=source_longest,
-                        total_frames=total_frames,
-                        fps=fps,
-                        streaming=True,
-                        live_original_path=live_original,
-                        live_enhanced_path=live_enhanced,
-                        on_line=on_stream_line,
-                        on_process=on_process,
-                        should_cancel=should_cancel,
-                        low_priority=low_priority,
-                    )
-                    progress_state["progress"] = 0.9
+                        return
+                    stream_progress = min(0.88, 0.05 + 0.83 * (stream_done / total_frames))
+                    last_stream_done["frames"] = stream_done
+                    progress_state["progress"] = stream_progress
                     update_job(
                         job_id,
-                        progress=0.9,
-                        message="FlashVSR streaming complete",
-                        etaSeconds=0,
-                        framesDone=expected_count,
+                        progress=stream_progress,
+                        message=f"FlashVSR streaming frame {stream_done}/{total_frames}",
+                        etaSeconds=flashvsr_eta(stream_done),
+                        framesDone=stream_done,
                         framesTotal=expected_count,
                         partialFramesReady=0,
                     )
-                else:
-                    chunk_frames = FLASHVSR_EXPORT_CHUNK_FRAMES
-                    total_chunks = math.ceil(total_frames / chunk_frames)
-                    chunk_input_dir = cache_root / "flashvsr_input_chunks"
-                    chunk_output_dir = cache_root / "flashvsr_output_chunks"
-                    chunk_input_dir.mkdir(parents=True, exist_ok=True)
-                    chunk_output_dir.mkdir(parents=True, exist_ok=True)
-                    chunk_outputs: list[Path] = []
 
-                    for chunk_index, start_frame in enumerate(range(0, total_frames, chunk_frames), start=1):
-                        if should_cancel():
-                            raise RuntimeError("FlashVSR export cancelled")
-                        frames_in_chunk = min(chunk_frames, total_frames - start_frame)
-                        chunk_input = chunk_input_dir / f"chunk_{chunk_index:05d}.mp4"
-                        chunk_output = chunk_output_dir / f"chunk_{chunk_index:05d}.mp4"
-                        model_chunk_output = chunk_output
-                        if frames_in_chunk < chunk_frames:
-                            model_chunk_output = chunk_output_dir / f"chunk_{chunk_index:05d}_padded.mp4"
-                        progress_value = min(0.88, 0.05 + 0.83 * (start_frame / total_frames))
-                        completed_frames = min(total_frames, start_frame + frames_in_chunk)
-                        if reusable_video_file(chunk_output, frames_in_chunk):
-                            chunk_outputs.append(chunk_output)
-                            progress_value = min(0.88, 0.05 + 0.83 * (completed_frames / total_frames))
-                            progress_state["progress"] = progress_value
-                            update_job(
-                                job_id,
-                                progress=progress_value,
-                                message=f"FlashVSR reused completed chunk {chunk_index}/{total_chunks}",
-                                etaSeconds=flashvsr_eta(completed_frames),
-                                framesDone=completed_frames,
-                                framesTotal=expected_count,
-                                partialFramesReady=completed_frames,
-                            )
-                            continue
-                        chunk_output.unlink(missing_ok=True)
-                        if model_chunk_output != chunk_output:
-                            model_chunk_output.unlink(missing_ok=True)
-                        progress_state["progress"] = progress_value
-                        update_job(
-                            job_id,
-                            progress=progress_value,
-                            message=f"FlashVSR preparing chunk {chunk_index}/{total_chunks}",
-                            etaSeconds=flashvsr_eta(start_frame),
-                            framesDone=start_frame,
-                            framesTotal=expected_count,
-                            partialFramesReady=start_frame,
-                        )
-                        chunk_meta = create_video_chunk(
-                            source,
-                            chunk_input,
-                            start_frame,
-                            frames_in_chunk,
-                            fps,
-                            longest_side_cap=requested_output_longest_side(metadata, request),
-                            min_frame_count=chunk_frames,
-                            low_priority=low_priority,
-                        )
-
-                        def on_chunk_line(
-                            line: str,
-                            chunk_no: int = chunk_index,
-                            done_frames: int = start_frame,
-                            chunk_frame_count: int = frames_in_chunk,
-                        ) -> None:
-                            if line:
-                                with log_path.open("a", encoding="utf-8", errors="replace") as log:
-                                    log.write(f"[chunk {chunk_no}/{total_chunks}] {line}\n")
-                            chunk_frames_done = flashvsr_chunk_frames_done_from_line(line, chunk_frame_count)
-                            current_done_frames = done_frames + (chunk_frames_done or 0)
-                            current_done_frames = min(total_frames, current_done_frames)
-                            chunk_progress = min(0.88, 0.05 + 0.83 * (current_done_frames / total_frames))
-                            progress_state["progress"] = chunk_progress
-                            update_job(
-                                job_id,
-                                progress=chunk_progress,
-                                message=f"FlashVSR chunk {chunk_no}/{total_chunks}: {line[:100]}" if line else f"FlashVSR chunk {chunk_no}/{total_chunks}",
-                                etaSeconds=flashvsr_eta(current_done_frames),
-                                framesDone=current_done_frames,
-                                framesTotal=expected_count,
-                                partialFramesReady=done_frames,
-                            )
-
-                        flashvsr_engine.enhance_video(
-                            chunk_input,
-                            model_chunk_output,
-                            flash_settings,
-                            source_longest_side=max(chunk_meta.get("width") or 0, chunk_meta.get("height") or 0),
-                            on_line=on_chunk_line,
-                            on_process=on_process,
-                            should_cancel=should_cancel,
-                            low_priority=low_priority,
-                        )
-                        if model_chunk_output != chunk_output:
-                            trim_video_frame_count(
-                                model_chunk_output,
-                                chunk_output,
-                                frames_in_chunk,
-                                low_priority=low_priority,
-                            )
-                        chunk_outputs.append(chunk_output)
-                        progress_value = min(0.88, 0.05 + 0.83 * (completed_frames / total_frames))
-                        progress_state["progress"] = progress_value
-                        update_job(
-                            job_id,
-                            progress=progress_value,
-                            message=f"FlashVSR completed chunk {chunk_index}/{total_chunks}",
-                            etaSeconds=flashvsr_eta(completed_frames),
-                            framesDone=completed_frames,
-                            framesTotal=expected_count,
-                            partialFramesReady=completed_frames,
-                        )
-
-                    update_job(
-                        job_id,
-                        progress=0.9,
-                        message="Concatenating FlashVSR chunks",
-                        etaSeconds=0,
-                        framesDone=expected_count,
-                        framesTotal=expected_count,
-                        partialFramesReady=expected_count,
-                    )
-                    concat_videos_copy(chunk_outputs, raw_output, low_priority=low_priority)
+                flashvsr_engine.enhance_video(
+                    source,
+                    raw_output,
+                    flash_settings,
+                    source_longest_side=source_longest,
+                    total_frames=total_frames,
+                    fps=fps,
+                    streaming=True,
+                    live_original_path=live_original,
+                    live_enhanced_path=live_enhanced,
+                    on_line=on_stream_line,
+                    on_process=on_process,
+                    should_cancel=should_cancel,
+                    low_priority=low_priority,
+                )
+                progress_state["progress"] = 0.9
+                update_job(
+                    job_id,
+                    progress=0.9,
+                    message="FlashVSR streaming complete",
+                    etaSeconds=0,
+                    framesDone=expected_count,
+                    framesTotal=expected_count,
+                    partialFramesReady=0,
+                )
             else:
                 raise ValueError(f"Unsupported native video engine: {request.engine}")
             engine_elapsed = time.monotonic() - engine_started
@@ -2859,25 +2713,11 @@ def export_partial_video(job_id: str, request: PartialExportRequest) -> dict:
         engine_name = job_snapshot.get("engine") or "hypir"
 
         if engine_name == "flashvsr":
-            frames_total = int(job_snapshot.get("framesTotal") or metadata.get("frameCount") or 0)
-            ready_chunks, frame_count = contiguous_flashvsr_chunks(CACHE_DIR / cache_key, frames_total)
-            if frame_count <= 0:
-                raise HTTPException(status_code=409, detail="No completed FlashVSR chunks are ready yet")
-            partial_raw = partial_root / "flashvsr_partial_raw.mp4"
-            output_path = partial_output_path(record, cache_key, frame_count, request)
-            try:
-                concat_videos_copy(ready_chunks, partial_raw, low_priority=low_priority)
-                selected_encoder = remux_video_with_source_audio(
-                    partial_raw,
-                    source,
-                    output_path,
-                    low_priority=low_priority,
-                )
-            except Exception as exc:
-                partial_raw.unlink(missing_ok=True)
-                output_path.unlink(missing_ok=True)
-                raise HTTPException(status_code=500, detail=f"Partial export failed: {exc}") from exc
-        elif engine_name == "hypir":
+            raise HTTPException(
+                status_code=400,
+                detail="Partial export is not available for FlashVSR streaming render because render chunks are disabled.",
+            )
+        if engine_name == "hypir":
             enhanced_frames = CACHE_DIR / cache_key / "enhanced"
             ready_frames = contiguous_ready_frames(enhanced_frames)
             frame_count = len(ready_frames)
@@ -2901,7 +2741,7 @@ def export_partial_video(job_id: str, request: PartialExportRequest) -> dict:
                 output_path.unlink(missing_ok=True)
                 raise HTTPException(status_code=500, detail=f"Partial export failed: {exc}") from exc
         else:
-            raise HTTPException(status_code=400, detail="Partial video is available for HYPIR and FlashVSR exports")
+            raise HTTPException(status_code=400, detail="Partial video is available for HYPIR exports")
 
         return {
             "outputUrl": f"/media/exports/{output_path.name}",

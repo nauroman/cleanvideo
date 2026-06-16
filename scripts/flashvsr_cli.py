@@ -347,7 +347,6 @@ def stream_flashvsr_tiny(module, pipe, args) -> None:
     try:
         with torch.no_grad():
             for cur_process_idx in range(process_total_num):
-                pipe.load_models_to_device(["dit"])
                 if cur_process_idx == 0:
                     pre_cache_k = [None] * len(pipe.dit.blocks)
                     pre_cache_v = [None] * len(pipe.dit.blocks)
@@ -419,7 +418,9 @@ def stream_flashvsr_tiny(module, pipe, args) -> None:
 
                 cur_latents = cur_latents - noise_pred_posi
                 del noise_pred_posi, lq_latents
-                pipe.load_models_to_device([])
+                # Match the official FlashVSR streaming pipeline: keep the DIT
+                # under its per-layer VRAM wrappers instead of full onload/offload
+                # cycles between every temporal step.
                 torch.cuda.empty_cache()
                 cur_lq_frame = source.slice(lq_pre_idx, lq_cur_idx).to(device)
                 cur_frames = pipe.TCDecoder.decode_video(

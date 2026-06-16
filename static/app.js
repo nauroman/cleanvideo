@@ -651,7 +651,7 @@ function isEngineAvailable(engine = state.engine) {
 }
 
 function supportsPartialExport(engine = state.engine) {
-  return engine === "hypir" || engine === "flashvsr";
+  return engine === "hypir";
 }
 
 function enhancedInfoLabel(engine = state.engine) {
@@ -710,7 +710,7 @@ function updateEngineUi() {
   els.previewButton.hidden = true;
   els.previewButton.title = `${selectedLabel} previews run automatically from the playhead`;
   if (!supportsPartialExport()) {
-    els.partialExportButton.title = "Partial export is available for HYPIR frames and completed FlashVSR chunks";
+    els.partialExportButton.title = "Partial export is available for HYPIR cached frames";
   }
   if (unavailable && status) {
     const reason = status?.blockedReason || status?.missing?.join(", ") || "engine is not ready";
@@ -1093,12 +1093,9 @@ function updatePartialExportButton() {
     els.partialExportButton.title = "Saving partial video";
   } else if (readyFrames > 0) {
     const totalText = totalFrames ? ` / ${totalFrames}` : "";
-    const sourceText = state.engine === "flashvsr" ? "completed FlashVSR chunk frames" : "ready enhanced frames";
-    els.partialExportButton.title = `Save ${readyFrames}${totalText} ${sourceText}`;
+    els.partialExportButton.title = `Save ${readyFrames}${totalText} ready enhanced frames`;
   } else {
-    els.partialExportButton.title = state.engine === "flashvsr"
-      ? "No completed FlashVSR chunks are ready yet"
-      : "No enhanced frames are ready yet";
+    els.partialExportButton.title = "No enhanced frames are ready yet";
   }
 }
 
