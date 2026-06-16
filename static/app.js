@@ -121,6 +121,7 @@ const els = {
   cancelAdapterButton: document.querySelector("#cancelAdapterButton"),
   seed: document.querySelector("#seed"),
   prompt: document.querySelector("#prompt"),
+  resourceMode: document.querySelector("#resourceMode"),
   encoder: document.querySelector("#encoder"),
   crf: document.querySelector("#crf"),
   crfValue: document.querySelector("#crfValue"),
@@ -413,6 +414,7 @@ function collectUiSettings() {
     flashvsrPreviewCap: els.flashvsrPreviewCap.value,
     seed: els.seed.value,
     prompt: els.prompt.value,
+    resourceMode: els.resourceMode.value,
     encoder: els.encoder.value,
     crf: els.crf.value,
   };
@@ -509,6 +511,7 @@ function applySavedSettings(settings = {}, { restoreEngine = true } = {}) {
     ["flashvsrPreviewCap", els.flashvsrPreviewCap],
     ["seed", els.seed],
     ["prompt", els.prompt],
+    ["resourceMode", els.resourceMode],
     ["encoder", els.encoder],
     ["crf", els.crf],
   ];
@@ -1157,6 +1160,7 @@ async function startExport() {
       videoId: state.video.id,
       crf: Number(els.crf.value),
       encoder: els.encoder.value,
+      resourceMode: els.resourceMode.value,
       ...collectSettings(),
     };
     const job = await api("/api/export", {
@@ -1306,6 +1310,7 @@ async function savePartialExport() {
       body: JSON.stringify({
         crf: Number(els.crf.value),
         encoder: els.encoder.value,
+        resourceMode: els.resourceMode.value,
       }),
     });
     const totalText = result.framesTotal ? ` / ${result.framesTotal}` : "";
@@ -1698,6 +1703,7 @@ els.prompt.addEventListener("input", () => {
     scheduleAutoPreview();
   });
 });
+els.resourceMode.addEventListener("change", saveLocalState);
 els.encoder.addEventListener("change", saveLocalState);
 els.crf.addEventListener("input", () => {
   els.crfValue.textContent = els.crf.value;

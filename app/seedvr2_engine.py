@@ -9,6 +9,7 @@ from typing import Callable
 
 from PIL import Image
 
+from .resource_control import process_creationflags
 from .video_ops import probe_video
 
 
@@ -180,7 +181,7 @@ class SeedVr2Engine:
             errors="replace",
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
-            creationflags=getattr(subprocess, "BELOW_NORMAL_PRIORITY_CLASS", 0) if low_priority else 0,
+            creationflags=process_creationflags(low_priority),
         )
         if on_process:
             on_process(process)

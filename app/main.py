@@ -30,6 +30,12 @@ from .film_adapter import (
 )
 from .flashvsr_engine import FlashVsrSettings, engine as flashvsr_engine
 from .hypir_engine import HypirSettings, engine
+from .resource_control import (
+    ResourceMode,
+    lower_current_process_priority,
+    process_creationflags,
+    resource_mode_is_balanced,
+)
 from .seedvr2_engine import SeedVr2Settings, engine as seedvr2_engine
 from .temporal_stabilizer import TemporalConsistency, stabilize_frame, temporal_mode_enabled
 from .video_ops import (
@@ -60,7 +66,7 @@ ADAPTER_DIR = WORK_DIR / "adapters"
 for directory in [UPLOAD_DIR, PREVIEW_DIR, EXPORT_DIR, JOB_DIR, CACHE_DIR, PARTIAL_DIR, ADAPTER_DIR]:
     directory.mkdir(parents=True, exist_ok=True)
 GENERATED_DIRS = [PREVIEW_DIR, CACHE_DIR, PARTIAL_DIR, JOB_DIR, EXPORT_DIR]
-APP_BUILD = "2026-06-16-flashvsr-live-render-v19"
+APP_BUILD = "2026-06-16-resource-mode-v20"
 ADAPTER_TRAINING_RECOVERY_LIMIT = 3
 SEEDVR2_PREVIEW_DEFAULT_LONGEST_SIDE = 1280
 FLASHVSR_PREVIEW_DEFAULT_LONGEST_SIDE = 1280
@@ -223,11 +229,13 @@ class ExportRequest(ProcessSettings):
     videoId: str
     crf: int = Field(default=18, ge=12, le=32)
     encoder: Literal["auto", "h264_nvenc", "libx264"] = "auto"
+    resourceMode: ResourceMode = "balanced"
 
 
 class PartialExportRequest(BaseModel):
     crf: int = Field(default=18, ge=12, le=32)
     encoder: Literal["auto", "h264_nvenc", "libx264"] = "auto"
+    resourceMode: ResourceMode = "balanced"
 
 
 class AdapterTrainRequest(BaseModel):
@@ -631,6 +639,7 @@ def create_short_preview_clip(
     center_seconds: float,
     longest_side: int,
     max_frames: int = FLASHVSR_PREVIEW_FRAMES,
+    low_priority: bool = False,
 ) -> tuple[int, int, float, float]:
     metadata = probe_video(video_path)
     fps = max(1.0, float(metadata.get("fps") or 30.0))
@@ -649,6 +658,14 @@ def create_short_preview_clip(
         "force_original_aspect_ratio=decrease:force_divisible_by=2"
     )
     video_filter = f"{scale_filter},tpad=stop_mode=clone:stop_duration={clip_duration:.3f}"
+    run_kwargs = {
+        "text": True,
+        "capture_output": True,
+        "check": True,
+    }
+    creationflags = process_creationflags(low_priority)
+    if creationflags:
+        run_kwargs["creationflags"] = creationflags
     subprocess.run(
         [
             "ffmpeg",
@@ -677,9 +694,7 @@ def create_short_preview_clip(
             "yuv420p",
             str(output_path),
         ],
-        text=True,
-        capture_output=True,
-        check=True,
+        **run_kwargs,
     )
     clip_metadata = probe_video(output_path)
     actual_duration = float(clip_metadata.get("duration") or clip_duration)
@@ -740,7 +755,7 @@ def video_fingerprint(record: dict) -> dict:
 
 def enhancement_settings(request: ExportRequest) -> dict:
     settings = request.model_dump(
-        exclude={"crf", "encoder", "seedvr2PreviewSize", "flashvsrPreviewCap"},
+        exclude={"crf", "encoder", "resourceMode", "seedvr2PreviewSize", "flashvsrPreviewCap"},
         mode="json",
     )
     upscale = settings.get("upscale")
@@ -900,11 +915,11 @@ def reusable_video_file(path: Path, min_frames: int | None = None) -> bool:
     return int(metadata.get("frameCount") or 0) >= max(1, min_frames)
 
 
-def reusable_frames(video_path: Path, frames_dir: Path, expected_count: int) -> list[Path]:
+def reusable_frames(video_path: Path, frames_dir: Path, expected_count: int, *, low_priority: bool = False) -> list[Path]:
     frames = sorted(frames_dir.glob("frame_*.png"))
     if frames and (expected_count <= 0 or len(frames) == expected_count):
         return frames
-    return extract_frames(video_path, frames_dir)
+    return extract_frames(video_path, frames_dir, low_priority=low_priority)
 
 
 def contiguous_ready_frames(frames_dir: Path) -> list[Path]:
@@ -1459,6 +1474,7 @@ def run_adapter_training(job_id: str, request: AdapterTrainRequest) -> None:
                     encoding="utf-8",
                     errors="replace",
                     env=env,
+                    creationflags=process_creationflags(True),
                 )
                 job_processes[job_id] = process
                 last_update = time.monotonic()
@@ -1703,7 +1719,7 @@ def preview_frame(request: PreviewRequest) -> dict:
         return preview_should_cancel(preview_token)
 
     try:
-        extract_frame(Path(record["path"]), request.seconds, original)
+        extract_frame(Path(record["path"]), request.seconds, original, low_priority=True)
         if request.engine == "seedvr2":
             safe_original = preview_root / "seedvr2_preview_source.png"
             safe_width, safe_height = create_seedvr2_preview_source(
@@ -1743,6 +1759,7 @@ def preview_frame(request: PreviewRequest) -> dict:
                 request.seconds,
                 effective_preview_cap,
                 max_frames=FLASHVSR_PREVIEW_FRAMES,
+                low_priority=True,
             )
             clip_frames = max(1, int(round(clip_duration * max(1.0, float(record["metadata"].get("fps") or 30.0)))))
             flash_settings = request.to_flashvsr_preview()
@@ -1761,7 +1778,7 @@ def preview_frame(request: PreviewRequest) -> dict:
             )
             elapsed = time.monotonic() - engine_started
             preview_seconds = min(max(0.0, request.seconds - clip_start), max(0.0, clip_duration - 0.001))
-            extract_frame(preview_video, preview_seconds, enhanced)
+            extract_frame(preview_video, preview_seconds, enhanced, low_priority=True)
             with Image.open(enhanced) as img:
                 result["width"] = img.width
                 result["height"] = img.height
@@ -1833,6 +1850,8 @@ def second_pass_enabled(request: ProcessSettings) -> bool:
 
 
 def run_native_video_export(job_id: str, request: ExportRequest) -> None:
+    low_priority = resource_mode_is_balanced(request.resourceMode)
+    restore_priority = lower_current_process_priority(low_priority)
     try:
         record = get_video(request.videoId)
         source = Path(record["path"])
@@ -1910,6 +1929,7 @@ def run_native_video_export(job_id: str, request: ExportRequest) -> None:
                     on_line=on_line,
                     on_process=on_process,
                     should_cancel=should_cancel,
+                    low_priority=low_priority,
                 )
             elif request.engine == "flashvsr":
                 if blocker := flashvsr_native_export_blocker(metadata, request):
@@ -2009,6 +2029,7 @@ def run_native_video_export(job_id: str, request: ExportRequest) -> None:
                         on_line=on_stream_line,
                         on_process=on_process,
                         should_cancel=should_cancel,
+                        low_priority=low_priority,
                     )
                     progress_state["progress"] = 0.9
                     update_job(
@@ -2075,6 +2096,7 @@ def run_native_video_export(job_id: str, request: ExportRequest) -> None:
                             fps,
                             longest_side_cap=requested_output_longest_side(metadata, request),
                             min_frame_count=chunk_frames,
+                            low_priority=low_priority,
                         )
 
                         def on_chunk_line(
@@ -2109,9 +2131,15 @@ def run_native_video_export(job_id: str, request: ExportRequest) -> None:
                             on_line=on_chunk_line,
                             on_process=on_process,
                             should_cancel=should_cancel,
+                            low_priority=low_priority,
                         )
                         if model_chunk_output != chunk_output:
-                            trim_video_frame_count(model_chunk_output, chunk_output, frames_in_chunk)
+                            trim_video_frame_count(
+                                model_chunk_output,
+                                chunk_output,
+                                frames_in_chunk,
+                                low_priority=low_priority,
+                            )
                         chunk_outputs.append(chunk_output)
                         progress_value = min(0.88, 0.05 + 0.83 * (completed_frames / total_frames))
                         progress_state["progress"] = progress_value
@@ -2134,7 +2162,7 @@ def run_native_video_export(job_id: str, request: ExportRequest) -> None:
                         framesTotal=expected_count,
                         partialFramesReady=expected_count,
                     )
-                    concat_videos_copy(chunk_outputs, raw_output)
+                    concat_videos_copy(chunk_outputs, raw_output, low_priority=low_priority)
             else:
                 raise ValueError(f"Unsupported native video engine: {request.engine}")
             engine_elapsed = time.monotonic() - engine_started
@@ -2179,7 +2207,7 @@ def run_native_video_export(job_id: str, request: ExportRequest) -> None:
             metric_resolution = None
         average_frame_seconds = engine_elapsed / max(1, expected_count)
         update_job(job_id, progress=0.92, message="Muxing processed video with source audio", etaSeconds=None)
-        mux_mode = remux_video_with_source_audio(raw_output, source, output_path)
+        mux_mode = remux_video_with_source_audio(raw_output, source, output_path, low_priority=low_priority)
         write_cache_manifest(cache_root, record, request, "complete")
         cleanup_message = "Scheduled intermediate cleanup"
         try:
@@ -2214,12 +2242,15 @@ def run_native_video_export(job_id: str, request: ExportRequest) -> None:
     finally:
         job_processes.pop(job_id, None)
         cancelled_jobs.discard(job_id)
+        restore_priority()
 
 
 def run_export(job_id: str, request: ExportRequest) -> None:
     if request.engine in {"seedvr2", "flashvsr"}:
         run_native_video_export(job_id, request)
         return
+    low_priority = resource_mode_is_balanced(request.resourceMode)
+    restore_priority = lower_current_process_priority(low_priority)
     try:
         record = get_video(request.videoId)
         source = Path(record["path"])
@@ -2266,7 +2297,7 @@ def run_export(job_id: str, request: ExportRequest) -> None:
             cancelled_jobs.discard(job_id)
             return
 
-        frames = reusable_frames(source, raw_frames, expected_count)
+        frames = reusable_frames(source, raw_frames, expected_count, low_priority=low_priority)
         total = len(frames)
         adapter_weight_path = get_adapter_weight_path(request.adapterId)
         adapter_settings = request.to_hypir(adapter_weight_path)
@@ -2554,6 +2585,7 @@ def run_export(job_id: str, request: ExportRequest) -> None:
             fps=fps,
             crf=request.crf,
             encoder=request.encoder,
+            low_priority=low_priority,
         )
         cleanup_message = "Scheduled intermediate cleanup"
         try:
@@ -2585,6 +2617,7 @@ def run_export(job_id: str, request: ExportRequest) -> None:
         )
     finally:
         cancelled_jobs.discard(job_id)
+        restore_priority()
 
 
 @app.post("/api/export")
@@ -2630,6 +2663,7 @@ def export_partial_video(job_id: str, request: PartialExportRequest) -> dict:
     partial_token = uuid.uuid4().hex
     partial_root = PARTIAL_DIR / partial_token
     partial_frames = partial_root / "frames"
+    low_priority = resource_mode_is_balanced(request.resourceMode)
     with jobs_lock:
         job = jobs.get(job_id)
         if not job:
@@ -2662,8 +2696,13 @@ def export_partial_video(job_id: str, request: PartialExportRequest) -> dict:
             partial_raw = partial_root / "flashvsr_partial_raw.mp4"
             output_path = partial_output_path(record, cache_key, frame_count, request)
             try:
-                concat_videos_copy(ready_chunks, partial_raw)
-                selected_encoder = remux_video_with_source_audio(partial_raw, source, output_path)
+                concat_videos_copy(ready_chunks, partial_raw, low_priority=low_priority)
+                selected_encoder = remux_video_with_source_audio(
+                    partial_raw,
+                    source,
+                    output_path,
+                    low_priority=low_priority,
+                )
             except Exception as exc:
                 partial_raw.unlink(missing_ok=True)
                 output_path.unlink(missing_ok=True)
@@ -2686,6 +2725,7 @@ def export_partial_video(job_id: str, request: PartialExportRequest) -> dict:
                     crf=request.crf,
                     encoder=request.encoder,
                     frame_count=frame_count,
+                    low_priority=low_priority,
                 )
             except Exception as exc:
                 output_path.unlink(missing_ok=True)

@@ -7,9 +7,25 @@ import subprocess
 from fractions import Fraction
 from pathlib import Path
 
+from .resource_control import process_creationflags
 
-def run_process(args: list[str], cwd: Path | None = None) -> subprocess.CompletedProcess:
-    return subprocess.run(args, cwd=cwd, text=True, capture_output=True, check=True)
+
+def run_process(
+    args: list[str],
+    cwd: Path | None = None,
+    *,
+    low_priority: bool = False,
+) -> subprocess.CompletedProcess:
+    kwargs = {
+        "cwd": cwd,
+        "text": True,
+        "capture_output": True,
+        "check": True,
+    }
+    creationflags = process_creationflags(low_priority)
+    if creationflags:
+        kwargs["creationflags"] = creationflags
+    return subprocess.run(args, **kwargs)
 
 
 def safe_name(name: str) -> str:
@@ -62,7 +78,7 @@ def probe_video(path: Path) -> dict:
     }
 
 
-def extract_frame(video_path: Path, seconds: float, output_path: Path) -> None:
+def extract_frame(video_path: Path, seconds: float, output_path: Path, *, low_priority: bool = False) -> None:
     output_path.parent.mkdir(parents=True, exist_ok=True)
     run_process(
         [
@@ -80,11 +96,12 @@ def extract_frame(video_path: Path, seconds: float, output_path: Path) -> None:
             "-q:v",
             "2",
             str(output_path),
-        ]
+        ],
+        low_priority=low_priority,
     )
 
 
-def extract_frames(video_path: Path, output_dir: Path) -> list[Path]:
+def extract_frames(video_path: Path, output_dir: Path, *, low_priority: bool = False) -> list[Path]:
     output_dir.mkdir(parents=True, exist_ok=True)
     for existing in output_dir.glob("frame_*.png"):
         existing.unlink()
@@ -102,7 +119,8 @@ def extract_frames(video_path: Path, output_dir: Path) -> list[Path]:
             "-q:v",
             "2",
             str(output_dir / "frame_%06d.png"),
-        ]
+        ],
+        low_priority=low_priority,
     )
     frames = sorted(output_dir.glob("frame_*.png"))
     if not frames:
@@ -161,6 +179,7 @@ def encode_video(
     crf: int,
     encoder: str = "auto",
     frame_count: int | None = None,
+    low_priority: bool = False,
 ) -> str:
     output_path.parent.mkdir(parents=True, exist_ok=True)
     base_args = [
@@ -187,7 +206,7 @@ def encode_video(
     selected, video_args = h264_video_args(encoder, crf)
 
     try:
-        run_process(base_args + video_args + tail_args)
+        run_process(base_args + video_args + tail_args, low_priority=low_priority)
     except subprocess.CalledProcessError:
         if selected == "h264_nvenc":
             selected = "libx264"
@@ -202,7 +221,7 @@ def encode_video(
                 "-pix_fmt",
                 "yuv420p",
             ]
-            run_process(base_args + video_args + tail_args)
+            run_process(base_args + video_args + tail_args, low_priority=low_priority)
         else:
             raise
     return selected
@@ -216,6 +235,7 @@ def create_video_chunk(
     fps: float,
     longest_side_cap: int | None = None,
     min_frame_count: int | None = None,
+    low_priority: bool = False,
 ) -> dict:
     output_path.parent.mkdir(parents=True, exist_ok=True)
     start_seconds = max(0.0, start_frame / max(1.0, fps))
@@ -262,11 +282,11 @@ def create_video_chunk(
             str(output_path),
         ]
     )
-    run_process(args)
+    run_process(args, low_priority=low_priority)
     return probe_video(output_path)
 
 
-def trim_video_frame_count(input_path: Path, output_path: Path, frame_count: int) -> None:
+def trim_video_frame_count(input_path: Path, output_path: Path, frame_count: int, *, low_priority: bool = False) -> None:
     output_path.parent.mkdir(parents=True, exist_ok=True)
     args = [
         "ffmpeg",
@@ -286,7 +306,7 @@ def trim_video_frame_count(input_path: Path, output_path: Path, frame_count: int
         str(output_path),
     ]
     try:
-        run_process(args)
+        run_process(args, low_priority=low_priority)
     except subprocess.CalledProcessError:
         run_process(
             [
@@ -311,11 +331,12 @@ def trim_video_frame_count(input_path: Path, output_path: Path, frame_count: int
                 "-pix_fmt",
                 "yuv420p",
                 str(output_path),
-            ]
+            ],
+            low_priority=low_priority,
         )
 
 
-def concat_videos_copy(video_paths: list[Path], output_path: Path) -> None:
+def concat_videos_copy(video_paths: list[Path], output_path: Path, *, low_priority: bool = False) -> None:
     if not video_paths:
         raise RuntimeError("No video chunks to concatenate.")
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -344,7 +365,8 @@ def concat_videos_copy(video_paths: list[Path], output_path: Path) -> None:
             "-movflags",
             "+faststart",
             str(output_path),
-        ]
+        ],
+        low_priority=low_priority,
     )
 
 
@@ -352,6 +374,8 @@ def remux_video_with_source_audio(
     processed_video: Path,
     source_video: Path,
     output_path: Path,
+    *,
+    low_priority: bool = False,
 ) -> str:
     output_path.parent.mkdir(parents=True, exist_ok=True)
     args = [
@@ -378,7 +402,7 @@ def remux_video_with_source_audio(
         str(output_path),
     ]
     try:
-        run_process(args)
+        run_process(args, low_priority=low_priority)
         return "video copy, audio copy"
     except subprocess.CalledProcessError:
         output_path.unlink(missing_ok=True)
@@ -392,5 +416,5 @@ def remux_video_with_source_audio(
             "+faststart",
             str(output_path),
         ]
-        run_process(fallback)
+        run_process(fallback, low_priority=low_priority)
         return "video copy, audio aac"

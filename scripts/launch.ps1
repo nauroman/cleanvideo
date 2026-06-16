@@ -10,7 +10,7 @@ $ErrorActionPreference = "Stop"
 $Root = Split-Path -Parent (Split-Path -Parent $MyInvocation.MyCommand.Path)
 $Python = Join-Path $Root ".venv\Scripts\python.exe"
 $Url = "http://127.0.0.1:$Port"
-$OpenUrl = "$Url/?v=2026-06-16-flashvsr-live-render-v19"
+$OpenUrl = "$Url/?v=2026-06-16-resource-mode-v20"
 $HealthUrl = "$Url/api/health"
 $StatusUrl = "$Url/api/status"
 
@@ -138,7 +138,7 @@ if (!$isCleanVideo) {
         -FilePath $Python `
         -ArgumentList @("-m", "uvicorn", "app.main:app", "--host", "127.0.0.1", "--port", "$Port") `
         -WorkingDirectory $Root `
-        -WindowStyle Minimized
+        -WindowStyle Hidden
 
     $deadline = (Get-Date).AddSeconds(90)
     while ((Get-Date) -lt $deadline) {

@@ -9,6 +9,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
 
+from .resource_control import process_creationflags
+
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -383,7 +385,7 @@ class FlashVsrEngine:
                 errors="replace",
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
-                creationflags=getattr(subprocess, "BELOW_NORMAL_PRIORITY_CLASS", 0) if low_priority else 0,
+                creationflags=process_creationflags(low_priority),
             )
             if on_process:
                 on_process(process)

@@ -4,7 +4,7 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>CleanVideo</title>
-    <link rel="stylesheet" href="/styles.css?v=2026-06-16-flashvsr-live-render-v19" />
+    <link rel="stylesheet" href="/styles.css?v=2026-06-16-resource-mode-v20" />
   </head>
   <body>
     <main class="app-shell">
@@ -548,6 +548,21 @@
           <h2>H.264 Export</h2>
           <div class="field">
             <span class="field-label">
+              Resource Mode
+              <button
+                class="help-button"
+                type="button"
+                aria-label="Resource Mode help"
+                data-tooltip="Responsive lowers OS scheduling priority for export workers and ffmpeg so foreground apps stay usable. It does not change model quality, batch size, scale, or H.264 quality. Maximum keeps normal process priority."
+              >?</button>
+            </span>
+            <select id="resourceMode" aria-label="Resource Mode">
+              <option value="balanced" selected>Responsive</option>
+              <option value="max">Maximum</option>
+            </select>
+          </div>
+          <div class="field">
+            <span class="field-label">
               Encoder
               <button
                 class="help-button"
@@ -578,6 +593,6 @@
         </section>
       </aside>
     </main>
-    <script src="/app.js?v=2026-06-16-flashvsr-live-render-v19" type="module"></script>
+    <script src="/app.js?v=2026-06-16-resource-mode-v20" type="module"></script>
   </body>
 </html>
