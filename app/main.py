@@ -872,6 +872,10 @@ def partial_output_path(record: dict, cache_key: str, frame_count: int, request:
     return EXPORT_DIR / safe_name(output_name)
 
 
+def flashvsr_chunk_output_path(cache_root: Path, chunk_index: int) -> Path:
+    return cache_root / "flashvsr_output_chunks" / f"chunk_{chunk_index:05d}.mp4"
+
+
 def write_cache_manifest(cache_root: Path, record: dict, request: ExportRequest, status: str) -> None:
     manifest = {
         "status": status,
@@ -912,6 +916,27 @@ def contiguous_ready_frames(frames_dir: Path) -> list[Path]:
         frames.append(frame_path)
         index += 1
     return frames
+
+
+def contiguous_flashvsr_chunks(cache_root: Path, total_frames: int) -> tuple[list[Path], int]:
+    total_frames = max(0, int(total_frames))
+    if total_frames <= 0:
+        return [], 0
+
+    chunks: list[Path] = []
+    frames_ready = 0
+    total_chunks = math.ceil(total_frames / FLASHVSR_EXPORT_CHUNK_FRAMES)
+    for chunk_index in range(1, total_chunks + 1):
+        start_frame = (chunk_index - 1) * FLASHVSR_EXPORT_CHUNK_FRAMES
+        frames_in_chunk = min(FLASHVSR_EXPORT_CHUNK_FRAMES, total_frames - start_frame)
+        if frames_in_chunk <= 0:
+            break
+        chunk_output = flashvsr_chunk_output_path(cache_root, chunk_index)
+        if not reusable_video_file(chunk_output, frames_in_chunk):
+            break
+        chunks.append(chunk_output)
+        frames_ready += frames_in_chunk
+    return chunks, frames_ready
 
 
 def snapshot_partial_frames(frames: list[Path], target_dir: Path) -> None:
@@ -1918,7 +1943,7 @@ def run_native_video_export(job_id: str, request: ExportRequest) -> None:
                             etaSeconds=flashvsr_eta(completed_frames),
                             framesDone=completed_frames,
                             framesTotal=expected_count,
-                            partialFramesReady=0,
+                            partialFramesReady=completed_frames,
                         )
                         continue
                     chunk_output.unlink(missing_ok=True)
@@ -1932,7 +1957,7 @@ def run_native_video_export(job_id: str, request: ExportRequest) -> None:
                         etaSeconds=flashvsr_eta(start_frame),
                         framesDone=start_frame,
                         framesTotal=expected_count,
-                        partialFramesReady=0,
+                        partialFramesReady=start_frame,
                     )
                     chunk_meta = create_video_chunk(
                         source,
@@ -1965,7 +1990,7 @@ def run_native_video_export(job_id: str, request: ExportRequest) -> None:
                             etaSeconds=flashvsr_eta(current_done_frames),
                             framesDone=current_done_frames,
                             framesTotal=expected_count,
-                            partialFramesReady=0,
+                            partialFramesReady=done_frames,
                         )
 
                     flashvsr_engine.enhance_video(
@@ -1989,7 +2014,7 @@ def run_native_video_export(job_id: str, request: ExportRequest) -> None:
                         etaSeconds=flashvsr_eta(completed_frames),
                         framesDone=completed_frames,
                         framesTotal=expected_count,
-                        partialFramesReady=0,
+                        partialFramesReady=completed_frames,
                     )
 
                 progress_state["progress"] = 0.9
@@ -2000,7 +2025,7 @@ def run_native_video_export(job_id: str, request: ExportRequest) -> None:
                     etaSeconds=0,
                     framesDone=expected_count,
                     framesTotal=expected_count,
-                    partialFramesReady=0,
+                    partialFramesReady=expected_count,
                 )
                 concat_videos_copy(chunk_outputs, raw_output)
             else:
@@ -2520,27 +2545,46 @@ def export_partial_video(job_id: str, request: PartialExportRequest) -> dict:
         source = Path(record["path"])
         metadata = record["metadata"]
         fps = float(metadata.get("fps") or 30.0)
-        enhanced_frames = CACHE_DIR / cache_key / "enhanced"
-        ready_frames = contiguous_ready_frames(enhanced_frames)
-        frame_count = len(ready_frames)
-        if frame_count <= 0:
-            raise HTTPException(status_code=409, detail="No enhanced frames are ready yet")
+        engine_name = job_snapshot.get("engine") or "hypir"
 
-        snapshot_partial_frames(ready_frames, partial_frames)
-        output_path = partial_output_path(record, cache_key, frame_count, request)
-        try:
-            selected_encoder = encode_video(
-                partial_frames,
-                source,
-                output_path,
-                fps=fps,
-                crf=request.crf,
-                encoder=request.encoder,
-                frame_count=frame_count,
-            )
-        except Exception as exc:
-            output_path.unlink(missing_ok=True)
-            raise HTTPException(status_code=500, detail=f"Partial export failed: {exc}") from exc
+        if engine_name == "flashvsr":
+            frames_total = int(job_snapshot.get("framesTotal") or metadata.get("frameCount") or 0)
+            ready_chunks, frame_count = contiguous_flashvsr_chunks(CACHE_DIR / cache_key, frames_total)
+            if frame_count <= 0:
+                raise HTTPException(status_code=409, detail="No completed FlashVSR chunks are ready yet")
+            partial_raw = partial_root / "flashvsr_partial_raw.mp4"
+            output_path = partial_output_path(record, cache_key, frame_count, request)
+            try:
+                concat_videos_copy(ready_chunks, partial_raw)
+                selected_encoder = remux_video_with_source_audio(partial_raw, source, output_path)
+            except Exception as exc:
+                partial_raw.unlink(missing_ok=True)
+                output_path.unlink(missing_ok=True)
+                raise HTTPException(status_code=500, detail=f"Partial export failed: {exc}") from exc
+        elif engine_name == "hypir":
+            enhanced_frames = CACHE_DIR / cache_key / "enhanced"
+            ready_frames = contiguous_ready_frames(enhanced_frames)
+            frame_count = len(ready_frames)
+            if frame_count <= 0:
+                raise HTTPException(status_code=409, detail="No enhanced frames are ready yet")
+
+            snapshot_partial_frames(ready_frames, partial_frames)
+            output_path = partial_output_path(record, cache_key, frame_count, request)
+            try:
+                selected_encoder = encode_video(
+                    partial_frames,
+                    source,
+                    output_path,
+                    fps=fps,
+                    crf=request.crf,
+                    encoder=request.encoder,
+                    frame_count=frame_count,
+                )
+            except Exception as exc:
+                output_path.unlink(missing_ok=True)
+                raise HTTPException(status_code=500, detail=f"Partial export failed: {exc}") from exc
+        else:
+            raise HTTPException(status_code=400, detail="Partial video is available for HYPIR and FlashVSR exports")
 
         return {
             "outputUrl": f"/media/exports/{output_path.name}",

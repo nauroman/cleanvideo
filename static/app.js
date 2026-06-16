@@ -625,6 +625,10 @@ function isEngineAvailable(engine = state.engine) {
   return Boolean(status.available);
 }
 
+function supportsPartialExport(engine = state.engine) {
+  return engine === "hypir" || engine === "flashvsr";
+}
+
 function enhancedInfoLabel(engine = state.engine) {
   if (engine === "seedvr2" || engine === "flashvsr") {
     return `${engineLabels[engine] || engine} auto preview`;
@@ -680,9 +684,9 @@ function updateEngineUi() {
     : "Film adapters are currently available only for HYPIR";
   els.previewButton.hidden = true;
   els.previewButton.title = `${selectedLabel} previews run automatically from the playhead`;
-  els.partialExportButton.title = state.engine === "hypir"
-    ? els.partialExportButton.title
-    : "Partial export is available only for HYPIR frame export";
+  if (!supportsPartialExport()) {
+    els.partialExportButton.title = "Partial export is available for HYPIR frames and completed FlashVSR chunks";
+  }
   if (unavailable && status) {
     const reason = status?.blockedReason || status?.missing?.join(", ") || "engine is not ready";
     setActivity(`${selectedLabel} blocked: ${reason}`, 0);
@@ -1005,22 +1009,26 @@ function setExportEnabled(enabled) {
 function updatePartialExportButton() {
   const readyFrames = state.lastExportFramesDone;
   const totalFrames = state.lastExportFramesTotal;
+  const supported = supportsPartialExport();
   const canSave = Boolean(
     state.exportInFlight
     && state.currentJobId
     && readyFrames > 0
     && !state.partialExportInFlight
-    && state.engine === "hypir"
+    && supported
   );
-  els.partialExportButton.hidden = !state.exportInFlight || state.engine !== "hypir";
+  els.partialExportButton.hidden = !state.exportInFlight || !supported;
   els.partialExportButton.disabled = !canSave;
   if (state.partialExportInFlight) {
     els.partialExportButton.title = "Saving partial video";
   } else if (readyFrames > 0) {
     const totalText = totalFrames ? ` / ${totalFrames}` : "";
-    els.partialExportButton.title = `Save ${readyFrames}${totalText} ready enhanced frames`;
+    const sourceText = state.engine === "flashvsr" ? "completed FlashVSR chunk frames" : "ready enhanced frames";
+    els.partialExportButton.title = `Save ${readyFrames}${totalText} ${sourceText}`;
   } else {
-    els.partialExportButton.title = "No enhanced frames are ready yet";
+    els.partialExportButton.title = state.engine === "flashvsr"
+      ? "No completed FlashVSR chunks are ready yet"
+      : "No enhanced frames are ready yet";
   }
 }
 
