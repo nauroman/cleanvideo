@@ -288,6 +288,9 @@ class FlashVsrEngine:
         should_cancel: Callable[[], bool] | None = None,
         low_priority: bool = False,
         timeout_seconds: float | None = None,
+        total_frames: int | None = None,
+        fps: float | None = None,
+        streaming: bool = False,
     ) -> dict:
         backend = self._active_backend()
         output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -311,6 +314,12 @@ class FlashVsrEngine:
                 "--quality",
                 str(settings.quality),
             )
+            if total_frames is not None:
+                args.extend(["--total_frames", str(max(1, int(total_frames)))])
+            if fps is not None and fps > 0:
+                args.extend(["--fps", str(float(fps))])
+            if streaming:
+                args.append("--streaming")
             env = os.environ.copy()
         else:
             args = [
@@ -332,6 +341,12 @@ class FlashVsrEngine:
                 "--quality",
                 str(settings.quality),
             ]
+            if total_frames is not None:
+                args.extend(["--total_frames", str(max(1, int(total_frames)))])
+            if fps is not None and fps > 0:
+                args.extend(["--fps", str(float(fps))])
+            if streaming:
+                args.append("--streaming")
             env = self._env()
         for attempt in range(1, FLASHVSR_TRANSIENT_IMPORT_ATTEMPTS + 1):
             if attempt > 1:

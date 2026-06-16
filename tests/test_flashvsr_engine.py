@@ -85,6 +85,37 @@ class FlashVsrEngineTests(unittest.TestCase):
             self.assertTrue(output_path.exists())
             self.assertTrue(any("transient Python import corruption" in line for line in lines))
 
+    def test_streaming_export_passes_frame_metadata_to_cli(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            input_path = root / "input.mp4"
+            output_path = root / "output.mp4"
+            input_path.write_bytes(b"input")
+            captured_args: list[str] = []
+
+            def fake_popen(args, *_args, **_kwargs):
+                captured_args.extend(str(arg) for arg in args)
+                return FakeFlashVsrProcess(["Done"], 0, output_path)
+
+            engine = FlashVsrEngine()
+            engine._active_backend = lambda: "windows"  # type: ignore[method-assign]
+
+            with patch("app.flashvsr_engine.subprocess.Popen", side_effect=fake_popen):
+                engine.enhance_video(
+                    input_path,
+                    output_path,
+                    FlashVsrSettings(variant="tiny_long"),
+                    total_frames=123,
+                    fps=23.976,
+                    streaming=True,
+                )
+
+            self.assertIn("--streaming", captured_args)
+            self.assertIn("--total_frames", captured_args)
+            self.assertIn("123", captured_args)
+            self.assertIn("--fps", captured_args)
+            self.assertIn("23.976", captured_args)
+
 
 if __name__ == "__main__":
     unittest.main()
