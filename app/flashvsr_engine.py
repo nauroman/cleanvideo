@@ -30,6 +30,15 @@ class FlashVsrSettings:
 FLASHVSR_TRANSIENT_IMPORT_ATTEMPTS = 3
 
 
+def is_wsl_mount_warning(line: str) -> bool:
+    return line.startswith("wsl: Failed to mount ")
+
+
+def is_cuda_out_of_memory(output: str) -> bool:
+    normalized = output.lower()
+    return "cuda error: out of memory" in normalized or "cuda out of memory" in normalized
+
+
 def is_transient_import_corruption(output: str) -> bool:
     normalized = output.replace("\\", "/")
     return (
@@ -414,11 +423,11 @@ class FlashVsrEngine:
             try:
                 for line in process.stdout:
                     stripped = line.rstrip()
+                    if is_wsl_mount_warning(stripped):
+                        continue
                     if stripped:
                         output_tail.append(stripped)
                         output_tail = output_tail[-20:]
-                    if stripped.startswith("wsl: Failed to mount "):
-                        continue
                     if on_line:
                         on_line(stripped)
                     if should_cancel and should_cancel():
@@ -440,6 +449,12 @@ class FlashVsrEngine:
                 break
 
             detail = "\n".join(output_tail[-10:])
+            if is_cuda_out_of_memory(detail):
+                suffix = f"\nLast output:\n{detail}" if detail else ""
+                raise RuntimeError(
+                    "FlashVSR ran out of CUDA memory. Lower Resolution/Scale Mode or choose a lighter variant."
+                    f"{suffix}"
+                )
             if attempt < FLASHVSR_TRANSIENT_IMPORT_ATTEMPTS and is_transient_flashvsr_worker_error(detail):
                 if on_line:
                     on_line(
@@ -454,6 +469,12 @@ class FlashVsrEngine:
                 raise RuntimeError(
                     "FlashVSR worker was killed with exit code 9. This usually means the selected "
                     "native resolution is above the available WSL RAM/VRAM budget. Lower Resolution/Scale Mode."
+                    f"{suffix}"
+                )
+            if return_code == 11:
+                raise RuntimeError(
+                    "FlashVSR worker crashed with exit code 11. This is usually a native CUDA/WSL crash "
+                    "from an oversized preview/export resolution. Lower Resolution/Scale Mode or choose a lighter variant."
                     f"{suffix}"
                 )
             raise RuntimeError(f"FlashVSR failed with exit code {return_code}{suffix}")

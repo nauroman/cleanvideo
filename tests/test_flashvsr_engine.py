@@ -6,8 +6,10 @@ from unittest.mock import patch
 from app.flashvsr_engine import (
     FlashVsrEngine,
     FlashVsrSettings,
+    is_cuda_out_of_memory,
     is_transient_import_corruption,
     is_transient_torch_load_corruption,
+    is_wsl_mount_warning,
 )
 
 
@@ -60,6 +62,15 @@ class FlashVsrEngineTests(unittest.TestCase):
         """
 
         self.assertTrue(is_transient_torch_load_corruption(detail))
+
+    def test_classifies_wsl_mount_warning_as_noise(self) -> None:
+        self.assertTrue(is_wsl_mount_warning("wsl: Failed to mount E:\\, see dmesg for more details."))
+        self.assertFalse(is_wsl_mount_warning("RuntimeError: CUDA error: out of memory"))
+
+    def test_detects_cuda_oom_detail(self) -> None:
+        self.assertTrue(is_cuda_out_of_memory("RuntimeError: CUDA error: out of memory"))
+        self.assertTrue(is_cuda_out_of_memory("CUDA out of memory. Tried to allocate 1 GiB"))
+        self.assertFalse(is_cuda_out_of_memory("wsl: Failed to mount E:\\, see dmesg for more details."))
 
     def test_retries_transient_import_corruption_once(self) -> None:
         with TemporaryDirectory() as temp_dir:
@@ -140,6 +151,28 @@ class FlashVsrEngineTests(unittest.TestCase):
             self.assertIn(str(live_original_path), captured_args)
             self.assertIn("--live_enhanced", captured_args)
             self.assertIn(str(live_enhanced_path), captured_args)
+
+    def test_exit_code_11_reports_cuda_crash_not_wsl_mount_noise(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            input_path = root / "input.mp4"
+            output_path = root / "output.mp4"
+            input_path.write_bytes(b"input")
+
+            def fake_popen(*_args, **_kwargs):
+                return FakeFlashVsrProcess(
+                    ["wsl: Failed to mount E:\\, see dmesg for more details."],
+                    11,
+                )
+
+            engine = FlashVsrEngine()
+            engine._active_backend = lambda: "windows"  # type: ignore[method-assign]
+
+            with patch("app.flashvsr_engine.subprocess.Popen", side_effect=fake_popen):
+                with self.assertRaisesRegex(RuntimeError, "exit code 11.*oversized preview/export resolution") as ctx:
+                    engine.enhance_video(input_path, output_path, FlashVsrSettings())
+
+            self.assertNotIn("Failed to mount", str(ctx.exception))
 
 
 if __name__ == "__main__":

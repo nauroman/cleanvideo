@@ -42,6 +42,7 @@ const state = {
   jobPollFailures: 0,
   adapterPollFailures: 0,
   status: null,
+  statusRefreshInFlight: null,
   engineMetrics: {},
 };
 
@@ -110,11 +111,9 @@ const els = {
   seedvr2TemporalOverlap: document.querySelector("#seedvr2TemporalOverlap"),
   seedvr2ChunkSize: document.querySelector("#seedvr2ChunkSize"),
   seedvr2ColorCorrection: document.querySelector("#seedvr2ColorCorrection"),
-  seedvr2PreviewSize: document.querySelector("#seedvr2PreviewSize"),
   flashvsrVariant: document.querySelector("#flashvsrVariant"),
   flashvsrSparseRatio: document.querySelector("#flashvsrSparseRatio"),
   flashvsrLocalRange: document.querySelector("#flashvsrLocalRange"),
-  flashvsrPreviewCap: document.querySelector("#flashvsrPreviewCap"),
   deleteAdapterButton: document.querySelector("#deleteAdapterButton"),
   deleteAllAdaptersButton: document.querySelector("#deleteAllAdaptersButton"),
   trainAdapterButton: document.querySelector("#trainAdapterButton"),
@@ -407,11 +406,9 @@ function collectUiSettings() {
     seedvr2TemporalOverlap: els.seedvr2TemporalOverlap.value,
     seedvr2ChunkSize: els.seedvr2ChunkSize.value,
     seedvr2ColorCorrection: els.seedvr2ColorCorrection.value,
-    seedvr2PreviewSize: els.seedvr2PreviewSize.value,
     flashvsrVariant: els.flashvsrVariant.value,
     flashvsrSparseRatio: els.flashvsrSparseRatio.value,
     flashvsrLocalRange: els.flashvsrLocalRange.value,
-    flashvsrPreviewCap: els.flashvsrPreviewCap.value,
     seed: els.seed.value,
     prompt: els.prompt.value,
     resourceMode: els.resourceMode.value,
@@ -504,11 +501,9 @@ function applySavedSettings(settings = {}, { restoreEngine = true } = {}) {
     ["seedvr2TemporalOverlap", els.seedvr2TemporalOverlap],
     ["seedvr2ChunkSize", els.seedvr2ChunkSize],
     ["seedvr2ColorCorrection", els.seedvr2ColorCorrection],
-    ["seedvr2PreviewSize", els.seedvr2PreviewSize],
     ["flashvsrVariant", els.flashvsrVariant],
     ["flashvsrSparseRatio", els.flashvsrSparseRatio],
     ["flashvsrLocalRange", els.flashvsrLocalRange],
-    ["flashvsrPreviewCap", els.flashvsrPreviewCap],
     ["seed", els.seed],
     ["prompt", els.prompt],
     ["resourceMode", els.resourceMode],
@@ -742,11 +737,9 @@ function collectSettings() {
     seedvr2TemporalOverlap: Number(els.seedvr2TemporalOverlap.value),
     seedvr2ChunkSize: Number(els.seedvr2ChunkSize.value),
     seedvr2ColorCorrection: els.seedvr2ColorCorrection.value,
-    seedvr2PreviewSize: Number(els.seedvr2PreviewSize.value),
     flashvsrVariant: els.flashvsrVariant.value,
     flashvsrSparseRatio: Number(els.flashvsrSparseRatio.value),
     flashvsrLocalRange: Number(els.flashvsrLocalRange.value),
-    flashvsrPreviewCap: Number(els.flashvsrPreviewCap.value),
     seed: Number(els.seed.value),
     device: "cuda",
   };
@@ -795,6 +788,42 @@ function resetGeneratedUi() {
   els.jobProgress.style.width = "0%";
   updatePartialExportButton();
   updateReadyPlaybackButton();
+}
+
+function resetAllWorkUi() {
+  window.clearTimeout(state.previewTimer);
+  if (state.jobTimer) clearInterval(state.jobTimer);
+  if (state.adapterTimer) clearInterval(state.adapterTimer);
+  state.jobTimer = null;
+  state.adapterTimer = null;
+  state.previewTimer = null;
+  state.previewController?.abort();
+  state.previewController = null;
+  state.previewInFlight = false;
+  state.previewDirty = false;
+  state.exportInFlight = false;
+  state.adapterInFlight = false;
+  state.partialExportInFlight = false;
+  state.currentJobId = null;
+  state.currentAdapterJobId = null;
+  state.video = null;
+  state.adapters = [];
+  state.adaptersById = new Map();
+  state.frameEventsAfter = 0;
+  state.jobPollFailures = 0;
+  state.adapterPollFailures = 0;
+  els.videoInput.value = "";
+  els.videoName.textContent = "No video selected";
+  els.videoMeta.textContent = "Upload an MP4, MOV, MKV, or AVI file";
+  els.sourceVideo.pause();
+  els.sourceVideo.removeAttribute("src");
+  els.sourceVideo.load();
+  els.timeline.max = "0";
+  els.timeline.value = "0";
+  els.currentTime.textContent = formatTime(0);
+  els.durationTime.textContent = formatTime(0);
+  resetGeneratedUi();
+  saveLocalState();
 }
 
 function setVideo(record, { persist = true } = {}) {
@@ -965,11 +994,22 @@ async function refreshStatus() {
     }
     updateEngineUi();
     setExportEnabled(!state.exportInFlight && !state.previewInFlight && !state.adapterInFlight);
+    return true;
   } catch (error) {
     els.gpuStatus.textContent = "error";
     els.nvencStatus.textContent = "error";
     els.modelStatus.textContent = "error";
+    return false;
   }
+}
+
+function refreshStatusOnce() {
+  if (!state.statusRefreshInFlight) {
+    state.statusRefreshInFlight = refreshStatus().finally(() => {
+      state.statusRefreshInFlight = null;
+    });
+  }
+  return state.statusRefreshInFlight;
 }
 
 async function uploadVideo(file) {
@@ -1038,7 +1078,14 @@ function updatePartialExportButton() {
 function scheduleAutoPreview({ delay = 450, reason = "settings changed" } = {}) {
   if (!state.video || state.exportInFlight) return;
   if (!isEngineAvailable()) {
+    const selectedLabel = engineLabels[state.engine] || state.engine;
     updateEngineUi();
+    setActivity(`Checking ${selectedLabel} status`, 0.08);
+    refreshStatusOnce().then((ok) => {
+      if (ok && isEngineAvailable() && state.video && !state.exportInFlight) {
+        scheduleAutoPreview({ delay, reason });
+      }
+    });
     return;
   }
   if (state.previewInFlight && state.engine !== "hypir") {
@@ -1339,24 +1386,31 @@ async function openOutputFolder() {
 }
 
 async function clearGeneratedFiles() {
-  if (state.exportInFlight || state.previewInFlight || state.partialExportInFlight) return;
+  if (state.exportInFlight || state.previewInFlight || state.partialExportInFlight || state.adapterInFlight) return;
   const confirmed = window.confirm(
-    "Delete all generated videos, preview images, cache files, and job records? Source uploads will stay."
+    "Delete everything under work, including source uploads, exports, cache, previews, job records, partial videos, and film adapters? Base models outside work will stay. This cannot be undone."
   );
   if (!confirmed) return;
 
   window.clearTimeout(state.previewTimer);
   state.previewDirty = false;
   els.clearGeneratedButton.disabled = true;
-  setActivity("Cleaning generated files", null);
+  setActivity("Cleaning all work files", null);
   try {
     const result = await api("/api/cleanup-generated", { method: "POST" });
-    resetGeneratedUi();
+    resetAllWorkUi();
+    try {
+      await loadAdapters("base");
+    } catch (error) {
+      setActivity(`Cleaned work files, but adapter list refresh failed: ${error.message}`, 0);
+      return;
+    }
+    saveLocalState();
     setActivity(
-      `Cleaned all generated/cache data: ${result.filesDeleted} files and ${result.directoriesDeleted} folders (${formatBytes(result.bytesFreed)} freed). Source uploads preserved.`,
+      `Cleaned all work files: ${result.filesDeleted} files and ${result.directoriesDeleted} folders (${formatBytes(result.bytesFreed)} freed). Uploads and film adapters removed.`,
       0
     );
-    await refreshStatus();
+    refreshStatus();
   } catch (error) {
     setActivity(`Cleanup failed: ${error.message}`, null);
   } finally {
@@ -1692,11 +1746,9 @@ els.prompt.addEventListener("input", () => {
   els.seedvr2TemporalOverlap,
   els.seedvr2ChunkSize,
   els.seedvr2ColorCorrection,
-  els.seedvr2PreviewSize,
   els.flashvsrVariant,
   els.flashvsrSparseRatio,
   els.flashvsrLocalRange,
-  els.flashvsrPreviewCap,
 ].forEach((element) => {
   element.addEventListener("change", () => {
     saveLocalState();

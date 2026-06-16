@@ -4,7 +4,7 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>CleanVideo</title>
-    <link rel="stylesheet" href="/styles.css?v=2026-06-16-resource-mode-v20" />
+    <link rel="stylesheet" href="/styles.css?v=2026-06-16-clean-all-work-v25" />
   </head>
   <body>
     <main class="app-shell">
@@ -462,23 +462,6 @@
               <option value="none">None</option>
             </select>
           </div>
-          <div class="field" data-engine-field="seedvr2">
-            <span class="field-label">
-              Preview Size
-              <button
-                class="help-button"
-                type="button"
-                aria-label="SeedVR2 Preview Size help"
-                data-tooltip="Manual preview output size. Safe keeps the UI responsive. 4K is available, but it is intentionally manual and cancels older previews before starting."
-              >?</button>
-            </span>
-            <select id="seedvr2PreviewSize" aria-label="SeedVR2 Preview Size">
-              <option value="640">640</option>
-              <option value="1280" selected>Safe 1280</option>
-              <option value="1920">Full HD</option>
-              <option value="3840">4K</option>
-            </select>
-          </div>
           <div class="field" data-engine-field="flashvsr">
             <span class="field-label">
               Variant
@@ -523,23 +506,6 @@
             <select id="flashvsrLocalRange" aria-label="FlashVSR Local Range">
               <option value="9">9</option>
               <option value="11" selected>11</option>
-            </select>
-          </div>
-          <div class="field" data-engine-field="flashvsr">
-            <span class="field-label">
-              Preview Size
-              <button
-                class="help-button"
-                type="button"
-                aria-label="FlashVSR Preview Size help"
-                data-tooltip="Manual FlashVSR preview output size. The backend cuts a short clip around the current frame and cancels older previews. 4K is available but can still be slow."
-              >?</button>
-            </span>
-            <select id="flashvsrPreviewCap" aria-label="FlashVSR Preview Size">
-              <option value="640">640</option>
-              <option value="1280" selected>Safe 1280</option>
-              <option value="1920">Full HD</option>
-              <option value="3840">4K</option>
             </select>
           </div>
         </section>
@@ -593,6 +559,6 @@
         </section>
       </aside>
     </main>
-    <script src="/app.js?v=2026-06-16-resource-mode-v20" type="module"></script>
+    <script src="/app.js?v=2026-06-16-clean-all-work-v25" type="module"></script>
   </body>
 </html>

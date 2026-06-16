@@ -12,7 +12,6 @@ import sys
 import threading
 import time
 import uuid
-from dataclasses import replace
 from datetime import datetime
 from pathlib import Path
 from typing import Literal
@@ -63,12 +62,18 @@ JOB_DIR = WORK_DIR / "jobs"
 CACHE_DIR = WORK_DIR / "cache"
 PARTIAL_DIR = WORK_DIR / "partials"
 ADAPTER_DIR = WORK_DIR / "adapters"
-for directory in [UPLOAD_DIR, PREVIEW_DIR, EXPORT_DIR, JOB_DIR, CACHE_DIR, PARTIAL_DIR, ADAPTER_DIR]:
-    directory.mkdir(parents=True, exist_ok=True)
+WORK_DIRS = [UPLOAD_DIR, PREVIEW_DIR, EXPORT_DIR, JOB_DIR, CACHE_DIR, PARTIAL_DIR, ADAPTER_DIR]
+
+
+def ensure_work_directories() -> None:
+    for directory in WORK_DIRS:
+        directory.mkdir(parents=True, exist_ok=True)
+
+
+ensure_work_directories()
 GENERATED_DIRS = [PREVIEW_DIR, CACHE_DIR, PARTIAL_DIR, JOB_DIR, EXPORT_DIR]
-APP_BUILD = "2026-06-16-resource-mode-v20"
+APP_BUILD = "2026-06-16-clean-all-work-v25"
 ADAPTER_TRAINING_RECOVERY_LIMIT = 3
-SEEDVR2_PREVIEW_DEFAULT_LONGEST_SIDE = 1280
 FLASHVSR_PREVIEW_DEFAULT_LONGEST_SIDE = 1280
 FLASHVSR_PREVIEW_FRAMES = 21
 FLASHVSR_PREVIEW_SAFE_MODEL_LONGEST_SIDE = 1920
@@ -139,11 +144,9 @@ class ProcessSettings(BaseModel):
     seedvr2TemporalOverlap: int = Field(default=3, ge=0, le=16)
     seedvr2ChunkSize: int = Field(default=170, ge=0, le=10000)
     seedvr2ColorCorrection: SeedVr2ColorCorrection = "lab"
-    seedvr2PreviewSize: int = Field(default=SEEDVR2_PREVIEW_DEFAULT_LONGEST_SIDE, ge=640, le=3840)
     flashvsrVariant: FlashVsrVariant = "tiny_long"
     flashvsrSparseRatio: float = Field(default=2.0, ge=0.5, le=4.0)
     flashvsrLocalRange: int = Field(default=11, ge=1, le=31)
-    flashvsrPreviewCap: int = Field(default=FLASHVSR_PREVIEW_DEFAULT_LONGEST_SIDE, ge=512, le=3840)
 
     def to_hypir(self, adapter_weight_path: Path | None = None) -> HypirSettings:
         return HypirSettings(
@@ -184,11 +187,11 @@ class ProcessSettings(BaseModel):
             chunk_size=self.seedvr2ChunkSize,
         )
 
-    def to_seedvr2_preview(self) -> SeedVr2Settings:
+    def to_seedvr2_preview(self, target_longest_side: int) -> SeedVr2Settings:
         return SeedVr2Settings(
             scale_by="longest_side",
             upscale=1,
-            target_longest_side=self.seedvr2PreviewSize,
+            target_longest_side=target_longest_side,
             seed=self.seed,
             device=self.device,
             batch_size=1,
@@ -208,11 +211,11 @@ class ProcessSettings(BaseModel):
             local_range=self.flashvsrLocalRange,
         )
 
-    def to_flashvsr_preview(self) -> FlashVsrSettings:
+    def to_flashvsr_preview(self, target_longest_side: int) -> FlashVsrSettings:
         return FlashVsrSettings(
             scale_by="longest_side",
             upscale=1,
-            target_longest_side=self.flashvsrPreviewCap,
+            target_longest_side=target_longest_side,
             seed=self.seed,
             variant=self.flashvsrVariant,
             sparse_ratio=self.flashvsrSparseRatio,
@@ -755,7 +758,7 @@ def video_fingerprint(record: dict) -> dict:
 
 def enhancement_settings(request: ExportRequest) -> dict:
     settings = request.model_dump(
-        exclude={"crf", "encoder", "resourceMode", "seedvr2PreviewSize", "flashvsrPreviewCap"},
+        exclude={"crf", "encoder", "resourceMode"},
         mode="json",
     )
     upscale = settings.get("upscale")
@@ -1104,6 +1107,57 @@ def clear_generated_dirs() -> dict:
         "verifiedEmpty": True,
         "uploadsPreserved": True,
     }
+
+
+def clear_work_dir() -> dict:
+    work_usage = remove_generated_path(WORK_DIR, recreate=True)
+    ensure_work_directories()
+    expected_children = {directory.name for directory in WORK_DIRS}
+    unexpected = sorted(child.name for child in WORK_DIR.iterdir() if child.name not in expected_children)
+    remaining = {
+        directory.name: usage
+        for directory in WORK_DIRS
+        if (usage := path_usage(directory))["files"] or usage["dirs"]
+    }
+    if unexpected or remaining:
+        details = []
+        if unexpected:
+            details.append(f"unexpected entries: {', '.join(unexpected)}")
+        if remaining:
+            details.append(
+                "remaining files: "
+                + ", ".join(
+                    f"{name}: {usage['dirs']} dirs, {usage['files']} files"
+                    for name, usage in remaining.items()
+                )
+        )
+        raise RuntimeError(f"Cleanup incomplete. {'; '.join(details)}")
+    return {
+        "cleaned": {"work": work_usage},
+        "filesDeleted": work_usage["files"],
+        "directoriesDeleted": work_usage["dirs"],
+        "bytesFreed": work_usage["bytes"],
+        "verifiedEmpty": True,
+        "workCleared": True,
+        "uploadsPreserved": False,
+        "adaptersPreserved": False,
+    }
+
+
+def clear_work_runtime_state() -> None:
+    videos.clear()
+    adapters.clear()
+    with jobs_lock:
+        stale_processes = list(job_processes.values())
+        jobs.clear()
+        job_frame_events.clear()
+        job_processes.clear()
+    for process in stale_processes:
+        terminate_process(process)
+    cancelled_jobs.clear()
+    partial_exports_active.clear()
+    with preview_lock:
+        cancelled_previews.clear()
 
 
 @app.on_event("startup")
@@ -1657,18 +1711,18 @@ def cleanup_generated() -> dict:
         active_jobs = [job.id for job in jobs.values() if job.status in {"queued", "running"}]
         active_partials = len(partial_exports_active)
     if active_jobs:
-        raise HTTPException(status_code=409, detail="Cannot clean generated files while an export is running")
+        raise HTTPException(status_code=409, detail="Cannot clean work files while a job is running")
     if active_partials:
-        raise HTTPException(status_code=409, detail="Cannot clean generated files while a partial video is being saved")
+        raise HTTPException(status_code=409, detail="Cannot clean work files while a partial video is being saved")
+    cancelled_previews_count = cancel_preview_runs()
+    unloaded = engine.unload_if_weight_under(WORK_DIR)
     try:
-        result = clear_generated_dirs()
+        result = clear_work_dir()
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Cleanup failed: {exc}") from exc
-    with jobs_lock:
-        jobs.clear()
-        job_frame_events.clear()
-    cancelled_jobs.clear()
-    partial_exports_active.clear()
+    clear_work_runtime_state()
+    result["cancelledPreviews"] = cancelled_previews_count
+    result["unloadedModel"] = unloaded
     return result
 
 
@@ -1719,19 +1773,20 @@ def preview_frame(request: PreviewRequest) -> dict:
         return preview_should_cancel(preview_token)
 
     try:
+        preview_target_longest = requested_output_longest_side(record["metadata"], request)
         extract_frame(Path(record["path"]), request.seconds, original, low_priority=True)
         if request.engine == "seedvr2":
             safe_original = preview_root / "seedvr2_preview_source.png"
             safe_width, safe_height = create_seedvr2_preview_source(
                 original,
                 safe_original,
-                request.seedvr2PreviewSize,
+                preview_target_longest,
             )
             engine_started = time.monotonic()
             result = seedvr2_engine.enhance_file(
                 safe_original,
                 enhanced,
-                request.to_seedvr2_preview(),
+                request.to_seedvr2_preview(preview_target_longest),
                 on_process=on_preview_process,
                 should_cancel=should_cancel_preview,
                 low_priority=True,
@@ -1747,36 +1802,62 @@ def preview_frame(request: PreviewRequest) -> dict:
         elif request.engine == "flashvsr":
             preview_clip = preview_root / "flashvsr_preview_input.mp4"
             preview_video = preview_root / "flashvsr_preview_output.mp4"
-            requested_preview_cap = request.flashvsrPreviewCap
+            requested_preview_cap = preview_target_longest
             effective_preview_cap = requested_preview_cap
-            flash_preview_upscale = False
             if requested_preview_cap > FLASHVSR_PREVIEW_SAFE_MODEL_LONGEST_SIDE:
                 effective_preview_cap = FLASHVSR_PREVIEW_SAFE_MODEL_LONGEST_SIDE
-                flash_preview_upscale = True
-            safe_width, safe_height, clip_start, clip_duration = create_short_preview_clip(
-                Path(record["path"]),
-                preview_clip,
-                request.seconds,
-                effective_preview_cap,
-                max_frames=FLASHVSR_PREVIEW_FRAMES,
-                low_priority=True,
-            )
-            clip_frames = max(1, int(round(clip_duration * max(1.0, float(record["metadata"].get("fps") or 30.0)))))
-            flash_settings = request.to_flashvsr_preview()
-            if effective_preview_cap != requested_preview_cap:
-                flash_settings = replace(flash_settings, target_longest_side=effective_preview_cap)
-            engine_started = time.monotonic()
-            result = flashvsr_engine.enhance_video(
-                preview_clip,
-                preview_video,
-                flash_settings,
-                source_longest_side=max(safe_width, safe_height),
-                on_process=on_preview_process,
-                should_cancel=should_cancel_preview,
-                low_priority=True,
-                timeout_seconds=FLASHVSR_PREVIEW_TIMEOUT_SECONDS,
-            )
-            elapsed = time.monotonic() - engine_started
+
+            def run_flashvsr_preview_once(model_cap: int) -> tuple[dict, int, int, float, float, int, float]:
+                preview_video.unlink(missing_ok=True)
+                safe_w, safe_h, clip_start_s, clip_duration_s = create_short_preview_clip(
+                    Path(record["path"]),
+                    preview_clip,
+                    request.seconds,
+                    model_cap,
+                    max_frames=FLASHVSR_PREVIEW_FRAMES,
+                    low_priority=True,
+                )
+                frames_in_clip = max(
+                    1,
+                    int(round(clip_duration_s * max(1.0, float(record["metadata"].get("fps") or 30.0)))),
+                )
+                flash_settings = request.to_flashvsr_preview(model_cap)
+                started = time.monotonic()
+                preview_result = flashvsr_engine.enhance_video(
+                    preview_clip,
+                    preview_video,
+                    flash_settings,
+                    source_longest_side=max(safe_w, safe_h),
+                    on_process=on_preview_process,
+                    should_cancel=should_cancel_preview,
+                    low_priority=True,
+                    timeout_seconds=FLASHVSR_PREVIEW_TIMEOUT_SECONDS,
+                )
+                return (
+                    preview_result,
+                    safe_w,
+                    safe_h,
+                    clip_start_s,
+                    clip_duration_s,
+                    frames_in_clip,
+                    time.monotonic() - started,
+                )
+
+            fallback_preview = False
+            try:
+                result, safe_width, safe_height, clip_start, clip_duration, clip_frames, elapsed = (
+                    run_flashvsr_preview_once(effective_preview_cap)
+                )
+            except RuntimeError as exc:
+                if not flashvsr_preview_should_retry_safe(exc, effective_preview_cap):
+                    raise
+                fallback_preview = True
+                effective_preview_cap = FLASHVSR_PREVIEW_DEFAULT_LONGEST_SIDE
+                result, safe_width, safe_height, clip_start, clip_duration, clip_frames, elapsed = (
+                    run_flashvsr_preview_once(effective_preview_cap)
+                )
+                result["fallbackReason"] = "FlashVSR preview retried at 1280px after the selected resolution exceeded VRAM"
+
             preview_seconds = min(max(0.0, request.seconds - clip_start), max(0.0, clip_duration - 0.001))
             extract_frame(preview_video, preview_seconds, enhanced, low_priority=True)
             with Image.open(enhanced) as img:
@@ -1784,13 +1865,14 @@ def preview_frame(request: PreviewRequest) -> dict:
                 result["height"] = img.height
             model_width = result["width"]
             model_height = result["height"]
-            if flash_preview_upscale:
+            if effective_preview_cap != requested_preview_cap:
                 final_width, final_height = upscale_image_to_longest_side(enhanced, requested_preview_cap)
                 result["width"] = final_width
                 result["height"] = final_height
                 result["modelWidth"] = model_width
                 result["modelHeight"] = model_height
-                result["previewMode"] = f"flashvsr_{request.flashvsrVariant}_4k_safe"
+                suffix = "fallback_safe" if fallback_preview else "4k_safe"
+                result["previewMode"] = f"flashvsr_{request.flashvsrVariant}_{suffix}"
             else:
                 result["previewMode"] = "flashvsr_safe"
             result["sourceWidth"] = safe_width
@@ -1801,7 +1883,7 @@ def preview_frame(request: PreviewRequest) -> dict:
             result["averageFrameSeconds"] = round(elapsed / max(1, clip_frames), 3)
             result["metricResolution"] = (
                 f"{model_width}x{model_height} -> {result['width']}x{result['height']}"
-                if flash_preview_upscale
+                if effective_preview_cap != requested_preview_cap
                 else f"{result['width']}x{result['height']}"
             )
         else:
@@ -1822,9 +1904,9 @@ def preview_frame(request: PreviewRequest) -> dict:
     except RuntimeError as exc:
         if "cancelled" in str(exc).lower():
             raise HTTPException(status_code=409, detail="Preview cancelled by a newer request") from exc
-        raise HTTPException(status_code=500, detail=f"Preview failed: {exc}") from exc
+        raise HTTPException(status_code=500, detail=user_facing_error(exc)) from exc
     except Exception as exc:
-        raise HTTPException(status_code=500, detail=f"Preview failed: {exc}") from exc
+        raise HTTPException(status_code=500, detail=user_facing_error(exc)) from exc
     finally:
         finish_preview_run(preview_token)
         if adapter_preview is not None:
@@ -1847,6 +1929,21 @@ def cancel_preview() -> dict:
 
 def second_pass_enabled(request: ProcessSettings) -> bool:
     return request.engine == "hypir" and request.secondPass == "base_after_adapter" and request.adapterId != "base"
+
+
+def flashvsr_preview_should_retry_safe(exc: Exception, model_cap: int) -> bool:
+    if model_cap <= FLASHVSR_PREVIEW_DEFAULT_LONGEST_SIDE:
+        return False
+    message = str(exc).lower()
+    retry_markers = [
+        "out of cuda memory",
+        "cuda error: out of memory",
+        "exit code 9",
+        "exit code 11",
+        "oversized preview/export resolution",
+        "above the available wsl ram/vram budget",
+    ]
+    return any(marker in message for marker in retry_markers)
 
 
 def run_native_video_export(job_id: str, request: ExportRequest) -> None:
