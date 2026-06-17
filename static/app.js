@@ -1,15 +1,19 @@
 const defaultEngine = "flashvsr";
-const settingsStorageVersion = 3;
+const settingsStorageVersion = 4;
 const settingsStorageKey = "cleanvideo.session.v1";
 const engineMetricsStorageKey = "cleanvideo.engineMetrics.v1";
 const previewBaseTimeoutMsByEngine = {
   flashvsr: 5 * 60 * 1000,
   seedvr2: 3 * 60 * 1000,
+  dove: 6 * 60 * 1000,
+  supir: 30 * 60 * 1000,
   hypir: 2 * 60 * 1000,
 };
 const previewMaxTimeoutMsByEngine = {
   flashvsr: 12 * 60 * 1000,
   seedvr2: 12 * 60 * 1000,
+  dove: 15 * 60 * 1000,
+  supir: 45 * 60 * 1000,
   hypir: 5 * 60 * 1000,
 };
 
@@ -62,6 +66,8 @@ const engineLabels = {
   hypir: "HYPIR",
   seedvr2: "SeedVR2",
   flashvsr: "FlashVSR",
+  dove: "DOVE",
+  supir: "SUPIR",
 };
 
 const els = {
@@ -119,6 +125,13 @@ const els = {
   flashvsrVariant: document.querySelector("#flashvsrVariant"),
   flashvsrSparseRatio: document.querySelector("#flashvsrSparseRatio"),
   flashvsrLocalRange: document.querySelector("#flashvsrLocalRange"),
+  doveChunkLength: document.querySelector("#doveChunkLength"),
+  doveTemporalOverlap: document.querySelector("#doveTemporalOverlap"),
+  doveCpuOffload: document.querySelector("#doveCpuOffload"),
+  supirSign: document.querySelector("#supirSign"),
+  supirColorFix: document.querySelector("#supirColorFix"),
+  supirSteps: document.querySelector("#supirSteps"),
+  supirMinSize: document.querySelector("#supirMinSize"),
   deleteAdapterButton: document.querySelector("#deleteAdapterButton"),
   deleteAllAdaptersButton: document.querySelector("#deleteAllAdaptersButton"),
   trainAdapterButton: document.querySelector("#trainAdapterButton"),
@@ -436,6 +449,13 @@ function collectUiSettings() {
     flashvsrVariant: els.flashvsrVariant.value,
     flashvsrSparseRatio: els.flashvsrSparseRatio.value,
     flashvsrLocalRange: els.flashvsrLocalRange.value,
+    doveChunkLength: els.doveChunkLength.value,
+    doveTemporalOverlap: els.doveTemporalOverlap.value,
+    doveCpuOffload: els.doveCpuOffload.value,
+    supirSign: els.supirSign.value,
+    supirColorFix: els.supirColorFix.value,
+    supirSteps: els.supirSteps.value,
+    supirMinSize: els.supirMinSize.value,
     seed: els.seed.value,
     prompt: els.prompt.value,
     resourceMode: els.resourceMode.value,
@@ -531,6 +551,13 @@ function applySavedSettings(settings = {}, { restoreEngine = true } = {}) {
     ["flashvsrVariant", els.flashvsrVariant],
     ["flashvsrSparseRatio", els.flashvsrSparseRatio],
     ["flashvsrLocalRange", els.flashvsrLocalRange],
+    ["doveChunkLength", els.doveChunkLength],
+    ["doveTemporalOverlap", els.doveTemporalOverlap],
+    ["doveCpuOffload", els.doveCpuOffload],
+    ["supirSign", els.supirSign],
+    ["supirColorFix", els.supirColorFix],
+    ["supirSteps", els.supirSteps],
+    ["supirMinSize", els.supirMinSize],
     ["seed", els.seed],
     ["prompt", els.prompt],
     ["resourceMode", els.resourceMode],
@@ -655,7 +682,7 @@ function supportsPartialExport(engine = state.engine) {
 }
 
 function enhancedInfoLabel(engine = state.engine) {
-  if (engine === "seedvr2" || engine === "flashvsr") {
+  if (engine === "seedvr2" || engine === "flashvsr" || engine === "dove") {
     return `${engineLabels[engine] || engine} auto preview`;
   }
   return `${engineLabels[engine] || engine} preview`;
@@ -767,6 +794,13 @@ function collectSettings() {
     flashvsrVariant: els.flashvsrVariant.value,
     flashvsrSparseRatio: Number(els.flashvsrSparseRatio.value),
     flashvsrLocalRange: Number(els.flashvsrLocalRange.value),
+    doveChunkLength: Number(els.doveChunkLength.value),
+    doveTemporalOverlap: Number(els.doveTemporalOverlap.value),
+    doveCpuOffload: els.doveCpuOffload.value === "true",
+    supirSign: els.supirSign.value,
+    supirColorFix: els.supirColorFix.value,
+    supirSteps: Number(els.supirSteps.value),
+    supirMinSize: Number(els.supirMinSize.value),
     seed: Number(els.seed.value),
     device: "cuda",
   };
@@ -1005,8 +1039,14 @@ async function refreshStatus() {
     const status = await api("/api/status");
     state.status = status;
     const selectedStatus = engineStatus();
-    const gpu = selectedStatus?.gpu || status.hypir.gpu || status.flashvsr?.gpu || "no cuda";
-    els.gpuStatus.textContent = (selectedStatus?.cudaAvailable ?? status.hypir.cudaAvailable)
+    const gpu = selectedStatus?.gpu
+      || status.hypir.gpu
+      || status.flashvsr?.gpu
+      || status.dove?.gpu
+      || status.supir?.gpu
+      || "no cuda";
+    const cudaReady = selectedStatus?.cudaAvailable ?? selectedStatus?.available ?? status.hypir.cudaAvailable;
+    els.gpuStatus.textContent = cudaReady
       ? gpu.replace("NVIDIA GeForce ", "")
       : "none";
     els.nvencStatus.textContent = status.nvenc ? "ready" : "missing";
@@ -1774,6 +1814,13 @@ els.prompt.addEventListener("input", () => {
   els.flashvsrVariant,
   els.flashvsrSparseRatio,
   els.flashvsrLocalRange,
+  els.doveChunkLength,
+  els.doveTemporalOverlap,
+  els.doveCpuOffload,
+  els.supirSign,
+  els.supirColorFix,
+  els.supirSteps,
+  els.supirMinSize,
 ].forEach((element) => {
   element.addEventListener("change", () => {
     saveLocalState();

@@ -27,6 +27,7 @@ from .film_adapter import (
     cleanup_adapter_training_artifacts,
     set_train_config_resume_checkpoint,
 )
+from .dove_engine import DoveSettings, engine as dove_engine
 from .flashvsr_engine import FlashVsrSettings, engine as flashvsr_engine
 from .hypir_engine import HypirSettings, engine
 from .resource_control import (
@@ -36,6 +37,7 @@ from .resource_control import (
     resource_mode_is_balanced,
 )
 from .seedvr2_engine import SeedVr2Settings, engine as seedvr2_engine
+from .supir_engine import SupirSettings, engine as supir_engine
 from .temporal_stabilizer import TemporalConsistency, stabilize_frame, temporal_mode_enabled
 from .video_ops import (
     encode_video,
@@ -69,7 +71,7 @@ def ensure_work_directories() -> None:
 
 ensure_work_directories()
 GENERATED_DIRS = [PREVIEW_DIR, CACHE_DIR, PARTIAL_DIR, JOB_DIR, EXPORT_DIR]
-APP_BUILD = "2026-06-16-adaptive-preview-timeout-v26"
+APP_BUILD = "2026-06-17-dove-supir-engines-v27"
 ADAPTER_TRAINING_RECOVERY_LIMIT = 3
 FLASHVSR_PREVIEW_DEFAULT_LONGEST_SIDE = 1280
 FLASHVSR_PREVIEW_FRAMES = 21
@@ -78,17 +80,24 @@ FLASHVSR_PREVIEW_TIMEOUT_SECONDS = 5 * 60
 FLASHVSR_FRAME_PROGRESS_RE = re.compile(r"^\s*(\d+)\s+(\d+)\s*$")
 FLASHVSR_LIVE_FRAME_RE = re.compile(r"^\s*LIVE_FRAME\s+(\d+)\s+(\d+)\s+([0-9.]+)\s*$")
 FLASHVSR_NATIVE_MIN_LONGEST_SIDE = 512
-EngineName = Literal["hypir", "seedvr2", "flashvsr"]
+DOVE_PREVIEW_FRAMES = 17
+DOVE_PREVIEW_DEFAULT_LONGEST_SIDE = 960
+SUPIR_PREVIEW_DEFAULT_LONGEST_SIDE = 1024
+EngineName = Literal["hypir", "seedvr2", "flashvsr", "dove", "supir"]
 ENGINE_VERSION = {
     "hypir": "hypir-sd2-v1",
     "seedvr2": "seedvr2-3b-fp8-cli-v1",
     "flashvsr": "flashvsr-v1.1-streaming-live-v3",
+    "dove": "dove-cogvideox-cli-v1",
+    "supir": "supir-folder-cli-v1",
 }
 
 AdapterQuality = Literal["fast", "high", "extra"]
 SecondPassMode = Literal["off", "base_after_adapter"]
 SeedVr2ColorCorrection = Literal["lab", "wavelet", "wavelet_adaptive", "hsv", "adain", "none"]
 FlashVsrVariant = Literal["tiny_long", "tiny", "full"]
+SupirSign = Literal["Q", "F"]
+SupirColorFix = Literal["None", "AdaIn", "Wavelet"]
 ADAPTER_QUALITY_PRESETS: dict[str, dict[str, float]] = {
     "fast": {
         "minFrames": 64,
@@ -143,6 +152,13 @@ class ProcessSettings(BaseModel):
     flashvsrVariant: FlashVsrVariant = "tiny_long"
     flashvsrSparseRatio: float = Field(default=2.0, ge=0.5, le=4.0)
     flashvsrLocalRange: int = Field(default=11, ge=1, le=31)
+    doveChunkLength: int = Field(default=0, ge=0, le=10000)
+    doveTemporalOverlap: int = Field(default=8, ge=0, le=64)
+    doveCpuOffload: bool = False
+    supirSign: SupirSign = "Q"
+    supirColorFix: SupirColorFix = "Wavelet"
+    supirSteps: int = Field(default=50, ge=1, le=100)
+    supirMinSize: int = Field(default=1024, ge=64, le=2048)
 
     def to_hypir(self, adapter_weight_path: Path | None = None) -> HypirSettings:
         return HypirSettings(
@@ -216,6 +232,50 @@ class ProcessSettings(BaseModel):
             variant=self.flashvsrVariant,
             sparse_ratio=self.flashvsrSparseRatio,
             local_range=self.flashvsrLocalRange,
+        )
+
+    def _integer_upscale(self, source_longest_side: int | None = None) -> int:
+        if self.scaleBy == "longest_side" and self.targetLongestSide and source_longest_side:
+            return max(1, min(4, math.ceil(self.targetLongestSide / max(1, source_longest_side))))
+        return max(1, min(4, int(round(float(self.upscale or 1)))))
+
+    def to_dove(self, source_longest_side: int | None = None) -> DoveSettings:
+        chunk_len = self.doveChunkLength
+        overlap_t = self.doveTemporalOverlap
+        if chunk_len > 0:
+            overlap_t = min(overlap_t, max(0, chunk_len - 1))
+        return DoveSettings(
+            scale_by=self.scaleBy,
+            upscale=self._integer_upscale(source_longest_side),
+            target_longest_side=self.targetLongestSide,
+            seed=self.seed,
+            chunk_len=chunk_len,
+            overlap_t=overlap_t,
+            cpu_offload=self.doveCpuOffload,
+        )
+
+    def to_supir(self, source_longest_side: int | None = None) -> SupirSettings:
+        return SupirSettings(
+            scale_by=self.scaleBy,
+            upscale=self._integer_upscale(source_longest_side),
+            target_longest_side=self.targetLongestSide,
+            seed=self.seed,
+            sign=self.supirSign,
+            color_fix_type=self.supirColorFix,
+            edm_steps=self.supirSteps,
+            min_size=self.supirMinSize,
+        )
+
+    def to_supir_preview(self, source_longest_side: int | None = None) -> SupirSettings:
+        return SupirSettings(
+            scale_by=self.scaleBy,
+            upscale=self._integer_upscale(source_longest_side),
+            target_longest_side=self.targetLongestSide,
+            seed=self.seed,
+            sign=self.supirSign,
+            color_fix_type=self.supirColorFix,
+            edm_steps=min(self.supirSteps, 50),
+            min_size=self.supirMinSize,
         )
 
 
@@ -1217,16 +1277,22 @@ def status() -> dict:
     hypir_status = engine.status()
     seedvr2_status = seedvr2_engine.status()
     flashvsr_status = flashvsr_engine.status()
+    dove_status = dove_engine.status()
+    supir_status = supir_engine.status()
     return {
         "app": "CleanVideo",
         "build": APP_BUILD,
         "hypir": hypir_status,
         "seedvr2": seedvr2_status,
         "flashvsr": flashvsr_status,
+        "dove": dove_status,
+        "supir": supir_status,
         "engines": {
             "hypir": hypir_status,
             "seedvr2": seedvr2_status,
             "flashvsr": flashvsr_status,
+            "dove": dove_status,
+            "supir": supir_status,
         },
         "ffmpeg": True,
         "nvenc": h264_nvenc_available(),
@@ -1263,6 +1329,20 @@ def engine_ready_error(engine_name: str) -> str | None:
         reason = flash_status.get("blockedReason")
         missing = flash_status.get("missing") or []
         return f"FlashVSR is not ready: {reason or ', '.join(missing) or 'engine dependencies are missing'}"
+    if engine_name == "dove":
+        dove_status = dove_engine.status()
+        if dove_status.get("available"):
+            return None
+        reason = dove_status.get("blockedReason")
+        missing = dove_status.get("missing") or []
+        return f"DOVE is not ready: {reason or ', '.join(missing) or 'engine dependencies are missing'}"
+    if engine_name == "supir":
+        supir_status = supir_engine.status()
+        if supir_status.get("available"):
+            return None
+        reason = supir_status.get("blockedReason")
+        missing = supir_status.get("missing") or []
+        return f"SUPIR is not ready: {reason or ', '.join(missing) or 'engine dependencies are missing'}"
     return f"Unknown engine: {engine_name}"
 
 
@@ -1936,6 +2016,70 @@ def preview_frame(request: PreviewRequest) -> dict:
                 if effective_preview_cap != requested_preview_cap
                 else f"{result['width']}x{result['height']}"
             )
+        elif request.engine == "dove":
+            preview_clip = preview_root / "dove_preview_input.mp4"
+            preview_video = preview_root / "dove_preview_output.mp4"
+            effective_preview_cap = min(preview_target_longest, DOVE_PREVIEW_DEFAULT_LONGEST_SIDE)
+            safe_width, safe_height, clip_start, clip_duration = create_short_preview_clip(
+                Path(record["path"]),
+                preview_clip,
+                request.seconds,
+                effective_preview_cap,
+                max_frames=DOVE_PREVIEW_FRAMES,
+                low_priority=True,
+            )
+            clip_frames = max(
+                1,
+                int(round(clip_duration * max(1.0, float(record["metadata"].get("fps") or 30.0)))),
+            )
+            engine_started = time.monotonic()
+            result = dove_engine.enhance_video(
+                preview_clip,
+                preview_video,
+                request.to_dove(max(safe_width, safe_height)),
+                fps=float(record["metadata"].get("fps") or 30.0),
+                on_process=on_preview_process,
+                should_cancel=should_cancel_preview,
+                low_priority=True,
+            )
+            elapsed = time.monotonic() - engine_started
+            preview_seconds = min(max(0.0, request.seconds - clip_start), max(0.0, clip_duration - 0.001))
+            extract_frame(preview_video, preview_seconds, enhanced, low_priority=True)
+            with Image.open(enhanced) as img:
+                result["width"] = img.width
+                result["height"] = img.height
+            result["previewMode"] = "dove_clip"
+            result["sourceWidth"] = safe_width
+            result["sourceHeight"] = safe_height
+            result["clipSeconds"] = round(clip_duration, 3)
+            result["framesProcessed"] = clip_frames
+            result["elapsedSeconds"] = round(elapsed, 3)
+            result["averageFrameSeconds"] = round(elapsed / max(1, clip_frames), 3)
+            result["metricResolution"] = f"{result['width']}x{result['height']}"
+        elif request.engine == "supir":
+            safe_original = preview_root / "supir_preview_source.png"
+            safe_width, safe_height = create_capped_preview_source(
+                original,
+                safe_original,
+                min(preview_target_longest, SUPIR_PREVIEW_DEFAULT_LONGEST_SIDE),
+            )
+            engine_started = time.monotonic()
+            result = supir_engine.enhance_file(
+                safe_original,
+                enhanced,
+                request.to_supir_preview(max(safe_width, safe_height)),
+                on_process=on_preview_process,
+                should_cancel=should_cancel_preview,
+                low_priority=True,
+            )
+            elapsed = time.monotonic() - engine_started
+            result["previewMode"] = "supir_preview"
+            result["sourceWidth"] = safe_width
+            result["sourceHeight"] = safe_height
+            result["framesProcessed"] = 1
+            result["elapsedSeconds"] = round(elapsed, 3)
+            result["averageFrameSeconds"] = round(elapsed, 3)
+            result["metricResolution"] = f"{result.get('width')}x{result.get('height')}"
         else:
             adapter_weight_path = get_adapter_weight_path(request.adapterId)
             engine_started = time.monotonic()
@@ -2031,7 +2175,12 @@ def run_native_video_export(job_id: str, request: ExportRequest) -> None:
         write_cache_manifest(cache_root, record, request, "running")
         raw_output = cache_root / f"{request.engine}_processed.mp4"
         log_path = cache_root / f"{request.engine}.log"
-        label = "SeedVR2" if request.engine == "seedvr2" else "FlashVSR"
+        native_labels = {
+            "seedvr2": "SeedVR2",
+            "flashvsr": "FlashVSR",
+            "dove": "DOVE",
+        }
+        label = native_labels.get(request.engine, request.engine)
         update_job(
             job_id,
             status="running",
@@ -2073,6 +2222,18 @@ def run_native_video_export(job_id: str, request: ExportRequest) -> None:
                     source,
                     raw_output,
                     request.to_seedvr2(),
+                    on_line=on_line,
+                    on_process=on_process,
+                    should_cancel=should_cancel,
+                    low_priority=low_priority,
+                )
+            elif request.engine == "dove":
+                source_longest = max(int(metadata.get("width") or 0), int(metadata.get("height") or 0))
+                dove_engine.enhance_video(
+                    source,
+                    raw_output,
+                    request.to_dove(source_longest),
+                    fps=float(metadata.get("fps") or 30.0),
                     on_line=on_line,
                     on_process=on_process,
                     should_cancel=should_cancel,
@@ -2269,9 +2430,245 @@ def run_native_video_export(job_id: str, request: ExportRequest) -> None:
         restore_priority()
 
 
+def run_supir_export(job_id: str, request: ExportRequest) -> None:
+    low_priority = resource_mode_is_balanced(request.resourceMode)
+    restore_priority = lower_current_process_priority(low_priority)
+    try:
+        record = get_video(request.videoId)
+        source = Path(record["path"])
+        metadata = record["metadata"]
+        expected_count = int(metadata.get("frameCount") or 0)
+        fps = float(metadata.get("fps") or 30.0)
+        cache_key = enhancement_cache_key(record, request)
+        output_path = export_output_path(record, cache_key, request)
+        if job_id in cancelled_jobs:
+            update_job(job_id, status="cancelled", progress=0, message="Stopped before export started")
+            cancelled_jobs.discard(job_id)
+            return
+        if output_path.exists() and output_path.stat().st_size > 0:
+            update_job(
+                job_id,
+                status="done",
+                progress=1.0,
+                message="Done. Reused cached SUPIR H.264 output",
+                etaSeconds=0,
+                framesDone=expected_count,
+                framesTotal=expected_count,
+                partialFramesReady=0,
+                cacheKey=cache_key,
+                outputUrl=f"/media/exports/{output_path.name}",
+                outputPath=str(output_path),
+            )
+            return
+
+        cache_root = CACHE_DIR / cache_key
+        raw_frames = cache_root / "frames"
+        enhanced_frames = cache_root / "enhanced"
+        pending_frames = cache_root / f"supir_pending_{uuid.uuid4().hex[:8]}"
+        supir_outputs = cache_root / f"supir_outputs_{uuid.uuid4().hex[:8]}"
+        enhanced_frames.mkdir(parents=True, exist_ok=True)
+        write_cache_manifest(cache_root, record, request, "running")
+
+        update_job(
+            job_id,
+            status="running",
+            progress=0.02,
+            message="Preparing source frames",
+            cacheKey=cache_key,
+        )
+        frames = reusable_frames(source, raw_frames, expected_count, low_priority=low_priority)
+        total = len(frames)
+        outputs = [
+            (frame, enhanced_frames / frame.name, valid_image(enhanced_frames / frame.name))
+            for frame in frames
+        ]
+        missing = [(frame, output) for frame, output, cached in outputs if not cached]
+        missing_total = len(missing)
+        cache_hits = total - missing_total
+        source_longest = max(int(metadata.get("width") or 0), int(metadata.get("height") or 0))
+        settings = request.to_supir(source_longest)
+        generation_elapsed = 0.0
+        latest_frame_seq = 0
+
+        def on_process(process: subprocess.Popen) -> None:
+            job_processes[job_id] = process
+
+        progress_state = {"progress": 0.05}
+
+        def on_line(line: str) -> None:
+            progress_state["progress"] = min(0.82, progress_state["progress"] + 0.002)
+            update_job(
+                job_id,
+                progress=progress_state["progress"],
+                message=f"SUPIR: {line[:140]}" if line else "SUPIR: running",
+                framesDone=cache_hits,
+                framesTotal=total,
+                partialFramesReady=0,
+            )
+
+        def should_cancel() -> bool:
+            return job_id in cancelled_jobs
+
+        try:
+            if missing_total:
+                pending_frames.mkdir(parents=True, exist_ok=True)
+                supir_outputs.mkdir(parents=True, exist_ok=True)
+                for frame, _output in missing:
+                    target = pending_frames / frame.name
+                    target.unlink(missing_ok=True)
+                    try:
+                        os.link(frame, target)
+                    except OSError:
+                        shutil.copy2(frame, target)
+
+                update_job(
+                    job_id,
+                    progress=0.05,
+                    message=f"Starting SUPIR on {missing_total} missing frame(s)",
+                    framesDone=cache_hits,
+                    framesTotal=total,
+                    partialFramesReady=0,
+                    cacheHits=cache_hits,
+                    cacheMisses=missing_total,
+                )
+                started = time.monotonic()
+                supir_engine.enhance_frames(
+                    pending_frames,
+                    supir_outputs,
+                    settings,
+                    on_line=on_line,
+                    on_process=on_process,
+                    should_cancel=should_cancel,
+                    low_priority=low_priority,
+                )
+                generation_elapsed = time.monotonic() - started
+        except RuntimeError as exc:
+            if "cancelled" in str(exc).lower():
+                write_cache_manifest(cache_root, record, request, "cancelled")
+                update_job(
+                    job_id,
+                    status="cancelled",
+                    progress=progress_state["progress"],
+                    message="SUPIR export cancelled",
+                    etaSeconds=None,
+                    framesDone=cache_hits,
+                    framesTotal=total,
+                    partialFramesReady=0,
+                )
+                cancelled_jobs.discard(job_id)
+                return
+            raise
+        finally:
+            job_processes.pop(job_id, None)
+
+        if job_id in cancelled_jobs:
+            write_cache_manifest(cache_root, record, request, "cancelled")
+            update_job(
+                job_id,
+                status="cancelled",
+                progress=progress_state["progress"],
+                message="SUPIR export cancelled",
+                etaSeconds=None,
+                framesDone=cache_hits,
+                framesTotal=total,
+                partialFramesReady=0,
+            )
+            cancelled_jobs.discard(job_id)
+            return
+
+        cache_misses_done = 0
+        for index, (frame, output, cached) in enumerate(outputs, start=1):
+            if not cached:
+                generated = supir_engine.output_for_input(supir_outputs, frame)
+                if not valid_image(generated):
+                    raise RuntimeError(f"SUPIR did not create a valid enhanced frame for {frame.name}")
+                shutil.copy2(generated, output)
+                cache_misses_done += 1
+            if valid_image(output):
+                frame_event = add_frame_event(
+                    job_id,
+                    frame_index=index,
+                    frames_total=total,
+                    seconds=(index - 1) / fps,
+                    original_path=frame,
+                    enhanced_path=output,
+                    cached=cached,
+                )
+                latest_frame_seq = frame_event.seq
+            update_job(
+                job_id,
+                progress=0.82 + index / max(total, 1) * 0.08,
+                message=f"SUPIR frame {index} / {total} ready",
+                framesDone=index,
+                framesTotal=total,
+                currentFrameIndex=index,
+                currentFrameSeconds=(index - 1) / fps,
+                currentOriginalUrl=media_url(frame),
+                currentEnhancedUrl=media_url(output),
+                latestFrameSeq=latest_frame_seq,
+                partialFramesReady=0,
+                cacheHits=cache_hits,
+                cacheMisses=cache_misses_done,
+            )
+
+        update_job(job_id, progress=0.92, message="Encoding H.264 video", etaSeconds=None)
+        selected_encoder = encode_video(
+            enhanced_frames,
+            source,
+            output_path,
+            fps=fps,
+            crf=request.crf,
+            encoder=request.encoder,
+            low_priority=low_priority,
+        )
+        write_cache_manifest(cache_root, record, request, "complete")
+        cleanup_message = "Scheduled intermediate cleanup"
+        try:
+            cleanup_delay = min(900, max(120, int(total * 0.04)))
+            cleanup_usage = schedule_generated_path_cleanup(cache_root, delay_seconds=cleanup_delay)
+            cleanup_message = f"Scheduled cleanup of {cleanup_usage['files']} intermediate files"
+        except Exception as exc:
+            cleanup_message = f"Intermediate cleanup failed: {exc}"
+        average_frame_seconds = generation_elapsed / max(1, missing_total) if missing_total else None
+        update_job(
+            job_id,
+            status="done",
+            progress=1.0,
+            message=f"Done. SUPIR encoded with {selected_encoder}. {cleanup_message}",
+            etaSeconds=0,
+            framesDone=total,
+            framesTotal=total,
+            partialFramesReady=0,
+            averageFrameSeconds=round(average_frame_seconds, 3) if average_frame_seconds else None,
+            metricResolution=image_resolution_label(enhanced_frames / frames[0].name) if frames else None,
+            metricSource="export",
+            outputUrl=f"/media/exports/{output_path.name}",
+            outputPath=str(output_path),
+        )
+    except Exception as exc:
+        update_job(
+            job_id,
+            status="error",
+            progress=0,
+            message="Export failed",
+            etaSeconds=None,
+            error=user_facing_error(exc),
+        )
+    finally:
+        job_processes.pop(job_id, None)
+        cancelled_jobs.discard(job_id)
+        for path in [locals().get("pending_frames"), locals().get("supir_outputs")]:
+            if isinstance(path, Path) and path.exists():
+                shutil.rmtree(path, ignore_errors=True)
+        restore_priority()
+
+
 def run_export(job_id: str, request: ExportRequest) -> None:
-    if request.engine in {"seedvr2", "flashvsr"}:
+    if request.engine in {"seedvr2", "flashvsr", "dove"}:
         run_native_video_export(job_id, request)
+        return
+    if request.engine == "supir":
+        run_supir_export(job_id, request)
         return
     low_priority = resource_mode_is_balanced(request.resourceMode)
     restore_priority = lower_current_process_priority(low_priority)

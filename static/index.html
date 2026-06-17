@@ -4,7 +4,7 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>CleanVideo</title>
-    <link rel="stylesheet" href="/styles.css?v=2026-06-16-adaptive-preview-timeout-v26" />
+    <link rel="stylesheet" href="/styles.css?v=2026-06-17-dove-supir-engines-v27" />
   </head>
   <body>
     <main class="app-shell">
@@ -29,14 +29,20 @@
             <small>Video-native</small>
             <small class="engine-speed" data-engine-speed="seedvr2">Speed: --</small>
           </button>
+          <button class="engine-card" type="button" data-engine="dove">
+            <span>DOVE</span>
+            <small>One-step VSR</small>
+            <small class="engine-speed" data-engine-speed="dove">Speed: --</small>
+          </button>
+          <button class="engine-card" type="button" data-engine="supir">
+            <span>SUPIR</span>
+            <small>SDXL frame</small>
+            <small class="engine-speed" data-engine-speed="supir">Speed: --</small>
+          </button>
           <button class="engine-card" type="button" data-engine="hypir">
             <span>HYPIR</span>
             <small>SD2 local CUDA</small>
             <small class="engine-speed" data-engine-speed="hypir">Speed: --</small>
-          </button>
-          <button class="engine-card disabled" type="button" aria-disabled="true">
-            <span>SUPIR</span>
-            <small>Later</small>
           </button>
         </section>
 
@@ -507,6 +513,115 @@
               <option value="11" selected>11</option>
             </select>
           </div>
+          <div class="field" data-engine-field="dove">
+            <span class="field-label">
+              Chunk Length
+              <button
+                class="help-button"
+                type="button"
+                aria-label="DOVE Chunk Length help"
+                data-tooltip="Temporal chunk length for DOVE. 0 runs the clip as one chunk. Use 9 or 17 with overlap on longer clips to reduce VRAM pressure."
+              >?</button>
+            </span>
+            <select id="doveChunkLength" aria-label="DOVE Chunk Length">
+              <option value="0" selected>0</option>
+              <option value="9">9</option>
+              <option value="17">17</option>
+              <option value="25">25</option>
+            </select>
+          </div>
+          <div class="field" data-engine-field="dove">
+            <span class="field-label">
+              Overlap
+              <button
+                class="help-button"
+                type="button"
+                aria-label="DOVE Overlap help"
+                data-tooltip="Overlapping frames between DOVE chunks. Keep it lower than Chunk Length. 4 is a practical low-memory setting for smoke tests."
+              >?</button>
+            </span>
+            <select id="doveTemporalOverlap" aria-label="DOVE Temporal Overlap">
+              <option value="0">0</option>
+              <option value="4">4</option>
+              <option value="8" selected>8</option>
+            </select>
+          </div>
+          <div class="field" data-engine-field="dove">
+            <span class="field-label">
+              Offload
+              <button
+                class="help-button"
+                type="button"
+                aria-label="DOVE Offload help"
+                data-tooltip="Sequential CPU offload lowers DOVE VRAM use but is slower. Leave it off on a 24 GB GPU unless an export runs out of memory."
+              >?</button>
+            </span>
+            <select id="doveCpuOffload" aria-label="DOVE CPU Offload">
+              <option value="false" selected>Off</option>
+              <option value="true">CPU</option>
+            </select>
+          </div>
+          <div class="field" data-engine-field="supir">
+            <span class="field-label">
+              Sign
+              <button
+                class="help-button"
+                type="button"
+                aria-label="SUPIR Sign help"
+                data-tooltip="SUPIR checkpoint. Q is the quality-oriented default. F is the fidelity-oriented checkpoint."
+              >?</button>
+            </span>
+            <select id="supirSign" aria-label="SUPIR Sign">
+              <option value="Q" selected>Q</option>
+              <option value="F">F</option>
+            </select>
+          </div>
+          <div class="field" data-engine-field="supir">
+            <span class="field-label">
+              Color Fix
+              <button
+                class="help-button"
+                type="button"
+                aria-label="SUPIR Color Fix help"
+                data-tooltip="Color correction applied after SUPIR. Wavelet is the default. None preserves raw model color."
+              >?</button>
+            </span>
+            <select id="supirColorFix" aria-label="SUPIR Color Fix">
+              <option value="Wavelet" selected>Wavelet</option>
+              <option value="AdaIn">AdaIn</option>
+              <option value="None">None</option>
+            </select>
+          </div>
+          <div class="field" data-engine-field="supir">
+            <span class="field-label">
+              Steps
+              <button
+                class="help-button"
+                type="button"
+                aria-label="SUPIR Steps help"
+                data-tooltip="SUPIR diffusion steps. 50 is the quality default. 1-4 is useful for fast setup validation."
+              >?</button>
+            </span>
+            <input id="supirSteps" type="number" min="1" max="100" step="1" value="50" aria-label="SUPIR Steps" />
+          </div>
+          <div class="field" data-engine-field="supir">
+            <span class="field-label">
+              Min Size
+              <button
+                class="help-button"
+                type="button"
+                aria-label="SUPIR Min Size help"
+                data-tooltip="Minimum short-side size before SUPIR inference. 1024 is the quality default. Lower values make smoke tests faster and use less VRAM."
+              >?</button>
+            </span>
+            <select id="supirMinSize" aria-label="SUPIR Min Size">
+              <option value="64">64</option>
+              <option value="128">128</option>
+              <option value="256">256</option>
+              <option value="512">512</option>
+              <option value="1024" selected>1024</option>
+            </select>
+          </div>
         </section>
 
         <section class="panel">
@@ -558,6 +673,6 @@
         </section>
       </aside>
     </main>
-    <script src="/app.js?v=2026-06-16-adaptive-preview-timeout-v26" type="module"></script>
+    <script src="/app.js?v=2026-06-17-dove-supir-engines-v27" type="module"></script>
   </body>
 </html>
