@@ -71,18 +71,14 @@ def ensure_work_directories() -> None:
 
 ensure_work_directories()
 GENERATED_DIRS = [PREVIEW_DIR, CACHE_DIR, PARTIAL_DIR, JOB_DIR, EXPORT_DIR]
-APP_BUILD = "2026-06-17-dove-supir-engines-v27"
+APP_BUILD = "2026-06-17-preview-real-settings-v30"
 ADAPTER_TRAINING_RECOVERY_LIMIT = 3
-FLASHVSR_PREVIEW_DEFAULT_LONGEST_SIDE = 1280
 FLASHVSR_PREVIEW_FRAMES = 21
-FLASHVSR_PREVIEW_SAFE_MODEL_LONGEST_SIDE = 1920
-FLASHVSR_PREVIEW_TIMEOUT_SECONDS = 5 * 60
+FLASHVSR_PREVIEW_TIMEOUT_SECONDS = 2 * 60
 FLASHVSR_FRAME_PROGRESS_RE = re.compile(r"^\s*(\d+)\s+(\d+)\s*$")
 FLASHVSR_LIVE_FRAME_RE = re.compile(r"^\s*LIVE_FRAME\s+(\d+)\s+(\d+)\s+([0-9.]+)\s*$")
 FLASHVSR_NATIVE_MIN_LONGEST_SIDE = 512
 DOVE_PREVIEW_FRAMES = 17
-DOVE_PREVIEW_DEFAULT_LONGEST_SIDE = 960
-SUPIR_PREVIEW_DEFAULT_LONGEST_SIDE = 1024
 EngineName = Literal["hypir", "seedvr2", "flashvsr", "dove", "supir"]
 ENGINE_VERSION = {
     "hypir": "hypir-sd2-v1",
@@ -254,6 +250,9 @@ class ProcessSettings(BaseModel):
             cpu_offload=self.doveCpuOffload,
         )
 
+    def to_dove_preview(self, source_longest_side: int | None = None) -> DoveSettings:
+        return self.to_dove(source_longest_side)
+
     def to_supir(self, source_longest_side: int | None = None) -> SupirSettings:
         return SupirSettings(
             scale_by=self.scaleBy,
@@ -267,16 +266,7 @@ class ProcessSettings(BaseModel):
         )
 
     def to_supir_preview(self, source_longest_side: int | None = None) -> SupirSettings:
-        return SupirSettings(
-            scale_by=self.scaleBy,
-            upscale=self._integer_upscale(source_longest_side),
-            target_longest_side=self.targetLongestSide,
-            seed=self.seed,
-            sign=self.supirSign,
-            color_fix_type=self.supirColorFix,
-            edm_steps=min(self.supirSteps, 50),
-            min_size=self.supirMinSize,
-        )
+        return self.to_supir(source_longest_side)
 
 
 class PreviewRequest(ProcessSettings):
@@ -753,6 +743,7 @@ def create_short_preview_clip(
     longest_side: int,
     max_frames: int = FLASHVSR_PREVIEW_FRAMES,
     low_priority: bool = False,
+    force_divisible_by: int = 2,
 ) -> tuple[int, int, float, float]:
     metadata = probe_video(video_path)
     fps = max(1.0, float(metadata.get("fps") or 30.0))
@@ -765,10 +756,11 @@ def create_short_preview_clip(
         start_seconds = max(0.0, center_seconds - clip_duration / 2)
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    safe_longest_side = max(256, min(3840, int(longest_side)))
+    safe_longest_side = max(256, min(8192, int(longest_side)))
+    safe_divisible_by = max(1, min(64, int(force_divisible_by)))
     scale_filter = (
         f"scale=w=min({safe_longest_side}\\,iw):h=min({safe_longest_side}\\,ih):"
-        "force_original_aspect_ratio=decrease:force_divisible_by=2"
+        f"force_original_aspect_ratio=decrease:force_divisible_by={safe_divisible_by}"
     )
     video_filter = f"{scale_filter},tpad=stop_mode=clone:stop_duration={clip_duration:.3f}"
     run_kwargs = {
@@ -838,20 +830,19 @@ def create_seedvr2_preview_source(image_path: Path, output_path: Path, longest_s
     return create_capped_preview_source(image_path, output_path, longest_side)
 
 
-def upscale_image_to_longest_side(image_path: Path, longest_side: int) -> tuple[int, int]:
-    with Image.open(image_path).convert("RGB") as img:
-        longest = max(img.size)
-        if longest <= 0 or longest == longest_side:
-            img.save(image_path)
-            return img.width, img.height
-        ratio = longest_side / longest
-        size = (
-            max(1, int(round(img.width * ratio))),
-            max(1, int(round(img.height * ratio))),
-        )
-        img = img.resize(size, Image.Resampling.LANCZOS)
-        img.save(image_path)
-        return img.width, img.height
+def preview_output_seek_seconds(
+    *,
+    requested_seconds: float,
+    clip_start_seconds: float,
+    clip_duration_seconds: float,
+    clip_frames: int,
+) -> float:
+    if clip_frames <= 1:
+        return 0.0
+    return min(
+        max(0.0, requested_seconds - clip_start_seconds),
+        max(0.0, clip_duration_seconds - 0.001),
+    )
 
 
 def video_fingerprint(record: dict) -> dict:
@@ -1933,9 +1924,6 @@ def preview_frame(request: PreviewRequest) -> dict:
             preview_clip = preview_root / "flashvsr_preview_input.mp4"
             preview_video = preview_root / "flashvsr_preview_output.mp4"
             requested_preview_cap = preview_target_longest
-            effective_preview_cap = requested_preview_cap
-            if requested_preview_cap > FLASHVSR_PREVIEW_SAFE_MODEL_LONGEST_SIDE:
-                effective_preview_cap = FLASHVSR_PREVIEW_SAFE_MODEL_LONGEST_SIDE
 
             def run_flashvsr_preview_once(model_cap: int) -> tuple[dict, int, int, float, float, int, float]:
                 preview_video.unlink(missing_ok=True)
@@ -1973,60 +1961,39 @@ def preview_frame(request: PreviewRequest) -> dict:
                     time.monotonic() - started,
                 )
 
-            fallback_preview = False
-            try:
-                result, safe_width, safe_height, clip_start, clip_duration, clip_frames, elapsed = (
-                    run_flashvsr_preview_once(effective_preview_cap)
-                )
-            except RuntimeError as exc:
-                if not flashvsr_preview_should_retry_safe(exc, effective_preview_cap):
-                    raise
-                fallback_preview = True
-                effective_preview_cap = FLASHVSR_PREVIEW_DEFAULT_LONGEST_SIDE
-                result, safe_width, safe_height, clip_start, clip_duration, clip_frames, elapsed = (
-                    run_flashvsr_preview_once(effective_preview_cap)
-                )
-                result["fallbackReason"] = "FlashVSR preview retried at 1280px after the selected resolution exceeded VRAM"
+            result, safe_width, safe_height, clip_start, clip_duration, clip_frames, elapsed = (
+                run_flashvsr_preview_once(requested_preview_cap)
+            )
 
-            preview_seconds = min(max(0.0, request.seconds - clip_start), max(0.0, clip_duration - 0.001))
+            preview_seconds = preview_output_seek_seconds(
+                requested_seconds=request.seconds,
+                clip_start_seconds=clip_start,
+                clip_duration_seconds=clip_duration,
+                clip_frames=clip_frames,
+            )
             extract_frame(preview_video, preview_seconds, enhanced, low_priority=True)
             with Image.open(enhanced) as img:
                 result["width"] = img.width
                 result["height"] = img.height
-            model_width = result["width"]
-            model_height = result["height"]
-            if effective_preview_cap != requested_preview_cap:
-                final_width, final_height = upscale_image_to_longest_side(enhanced, requested_preview_cap)
-                result["width"] = final_width
-                result["height"] = final_height
-                result["modelWidth"] = model_width
-                result["modelHeight"] = model_height
-                suffix = "fallback_safe" if fallback_preview else "4k_safe"
-                result["previewMode"] = f"flashvsr_{request.flashvsrVariant}_{suffix}"
-            else:
-                result["previewMode"] = "flashvsr_safe"
+            result["previewMode"] = f"flashvsr_{request.flashvsrVariant}_preview"
             result["sourceWidth"] = safe_width
             result["sourceHeight"] = safe_height
             result["clipSeconds"] = round(clip_duration, 3)
             result["framesProcessed"] = clip_frames
             result["elapsedSeconds"] = round(elapsed, 3)
             result["averageFrameSeconds"] = round(elapsed / max(1, clip_frames), 3)
-            result["metricResolution"] = (
-                f"{model_width}x{model_height} -> {result['width']}x{result['height']}"
-                if effective_preview_cap != requested_preview_cap
-                else f"{result['width']}x{result['height']}"
-            )
+            result["metricResolution"] = f"{result['width']}x{result['height']}"
         elif request.engine == "dove":
             preview_clip = preview_root / "dove_preview_input.mp4"
             preview_video = preview_root / "dove_preview_output.mp4"
-            effective_preview_cap = min(preview_target_longest, DOVE_PREVIEW_DEFAULT_LONGEST_SIDE)
             safe_width, safe_height, clip_start, clip_duration = create_short_preview_clip(
                 Path(record["path"]),
                 preview_clip,
                 request.seconds,
-                effective_preview_cap,
+                preview_target_longest,
                 max_frames=DOVE_PREVIEW_FRAMES,
                 low_priority=True,
+                force_divisible_by=16,
             )
             clip_frames = max(
                 1,
@@ -2036,14 +2003,19 @@ def preview_frame(request: PreviewRequest) -> dict:
             result = dove_engine.enhance_video(
                 preview_clip,
                 preview_video,
-                request.to_dove(max(safe_width, safe_height)),
+                request.to_dove_preview(max(safe_width, safe_height)),
                 fps=float(record["metadata"].get("fps") or 30.0),
                 on_process=on_preview_process,
                 should_cancel=should_cancel_preview,
                 low_priority=True,
             )
             elapsed = time.monotonic() - engine_started
-            preview_seconds = min(max(0.0, request.seconds - clip_start), max(0.0, clip_duration - 0.001))
+            preview_seconds = preview_output_seek_seconds(
+                requested_seconds=request.seconds,
+                clip_start_seconds=clip_start,
+                clip_duration_seconds=clip_duration,
+                clip_frames=clip_frames,
+            )
             extract_frame(preview_video, preview_seconds, enhanced, low_priority=True)
             with Image.open(enhanced) as img:
                 result["width"] = img.width
@@ -2061,7 +2033,7 @@ def preview_frame(request: PreviewRequest) -> dict:
             safe_width, safe_height = create_capped_preview_source(
                 original,
                 safe_original,
-                min(preview_target_longest, SUPIR_PREVIEW_DEFAULT_LONGEST_SIDE),
+                preview_target_longest,
             )
             engine_started = time.monotonic()
             result = supir_engine.enhance_file(
@@ -2123,21 +2095,6 @@ def cancel_preview() -> dict:
 
 def second_pass_enabled(request: ProcessSettings) -> bool:
     return request.engine == "hypir" and request.secondPass == "base_after_adapter" and request.adapterId != "base"
-
-
-def flashvsr_preview_should_retry_safe(exc: Exception, model_cap: int) -> bool:
-    if model_cap <= FLASHVSR_PREVIEW_DEFAULT_LONGEST_SIDE:
-        return False
-    message = str(exc).lower()
-    retry_markers = [
-        "out of cuda memory",
-        "cuda error: out of memory",
-        "exit code 9",
-        "exit code 11",
-        "oversized preview/export resolution",
-        "above the available wsl ram/vram budget",
-    ]
-    return any(marker in message for marker in retry_markers)
 
 
 def run_native_video_export(job_id: str, request: ExportRequest) -> None:

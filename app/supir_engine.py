@@ -57,7 +57,7 @@ class SupirEngine:
 
     @property
     def cli_path(self) -> Path:
-        return self.repo_path / "test.py"
+        return self.root / "scripts" / "supir_cli.py"
 
     @property
     def config_path(self) -> Path:

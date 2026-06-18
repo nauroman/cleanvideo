@@ -2,20 +2,7 @@ const defaultEngine = "flashvsr";
 const settingsStorageVersion = 4;
 const settingsStorageKey = "cleanvideo.session.v1";
 const engineMetricsStorageKey = "cleanvideo.engineMetrics.v1";
-const previewBaseTimeoutMsByEngine = {
-  flashvsr: 5 * 60 * 1000,
-  seedvr2: 3 * 60 * 1000,
-  dove: 6 * 60 * 1000,
-  supir: 30 * 60 * 1000,
-  hypir: 2 * 60 * 1000,
-};
-const previewMaxTimeoutMsByEngine = {
-  flashvsr: 12 * 60 * 1000,
-  seedvr2: 12 * 60 * 1000,
-  dove: 15 * 60 * 1000,
-  supir: 45 * 60 * 1000,
-  hypir: 5 * 60 * 1000,
-};
+const PREVIEW_TIMEOUT_MS = 2 * 60 * 1000;
 
 const state = {
   engine: defaultEngine,
@@ -228,26 +215,25 @@ function formatDuration(seconds) {
   return `${secs}s`;
 }
 
-function sourceLongestSide() {
-  const metadata = state.video?.metadata || {};
-  return Math.max(Number(metadata.width) || 0, Number(metadata.height) || 0, 1);
+function previewTimeoutMs(_settings) {
+  return PREVIEW_TIMEOUT_MS;
 }
 
-function requestedPreviewLongestSide(settings) {
-  if (settings.scaleBy === "longest_side") {
-    return Math.max(1, Number(settings.targetLongestSide) || sourceLongestSide());
+function previewTimeoutAdvice(engine, settings = {}) {
+  const resolution = settings.scaleBy === "longest_side" ? "Resolution" : "Scale Mode";
+  if (engine === "supir") {
+    return `Try lower ${resolution}, Steps, or Min Size.`;
   }
-  const factor = Math.max(1, Math.min(4, Number(settings.upscale) || 1));
-  return Math.max(1, Math.round(sourceLongestSide() * factor));
-}
-
-function previewTimeoutMs(settings) {
-  const base = previewBaseTimeoutMsByEngine[state.engine] || 2 * 60 * 1000;
-  const max = previewMaxTimeoutMsByEngine[state.engine] || base;
-  const targetLongestSide = requestedPreviewLongestSide(settings);
-  const areaRatio = Math.max(1, targetLongestSide / 1280) ** 2;
-  const scaled = base * Math.min(4, areaRatio);
-  return Math.min(max, Math.max(base, Math.round(scaled)));
+  if (engine === "dove") {
+    return `Try lower ${resolution}, Chunk Length, or Overlap.`;
+  }
+  if (engine === "flashvsr") {
+    return `Try lower ${resolution}, Local Range, or choose Tiny instead of Full.`;
+  }
+  if (engine === "seedvr2") {
+    return `Try lower ${resolution}, Batch Size, or Temporal Overlap.`;
+  }
+  return `Try lower ${resolution}, Patch Size, or turn off the second pass.`;
 }
 
 function formatBytes(bytes) {
@@ -1184,11 +1170,12 @@ async function runAutoPreview({ manual = false } = {}) {
   setActivity(state.engine === "hypir" ? "Enhancing preview" : `Running ${selectedLabel} preview`, 0.2);
   let timedOut = false;
   let timeoutId = null;
-  let timeoutMs = previewBaseTimeoutMsByEngine[state.engine] || 2 * 60 * 1000;
+  let timeoutMs = PREVIEW_TIMEOUT_MS;
+  let body = null;
   try {
     const controller = new AbortController();
     state.previewController = controller;
-    const body = {
+    body = {
       videoId: state.video.id,
       seconds: Number(els.timeline.value),
       ...collectSettings(),
@@ -1207,13 +1194,12 @@ async function runAutoPreview({ manual = false } = {}) {
     });
     if (version !== state.previewVersion || state.previewDirty) return;
     const passText = preview.passes === 2 ? " | 2 passes" : "";
-    const modeText = String(preview.result.previewMode || "").endsWith("_safe") ? " | safe preview" : "";
     const clipText = preview.result.clipSeconds ? ` | ${preview.result.clipSeconds}s clip` : "";
     showFramePair({
       originalUrl: `${preview.originalUrl}?t=${Date.now()}`,
       enhancedUrl: `${preview.enhancedUrl}?t=${Date.now()}`,
       originalInfo: formatTime(preview.seconds),
-      enhancedInfo: `${preview.result.width}x${preview.result.height}${modeText}${clipText} | seed ${preview.result.seed}${passText}`,
+      enhancedInfo: `${preview.result.width}x${preview.result.height}${clipText} | seed ${preview.result.seed}${passText}`,
     });
     rememberEngineMetric(state.engine, {
       averageFrameSeconds: preview.result.averageFrameSeconds,
@@ -1224,7 +1210,10 @@ async function runAutoPreview({ manual = false } = {}) {
     await refreshStatus();
   } catch (error) {
     if (timedOut && version === state.previewVersion) {
-      setActivity(`Preview timed out after ${formatDuration(timeoutMs / 1000)} and was cancelled`, 0);
+      setActivity(
+        `Preview timed out after ${formatDuration(timeoutMs / 1000)} and was cancelled. ${previewTimeoutAdvice(state.engine, body || {})}`,
+        0
+      );
     } else if (error.name !== "AbortError" && !String(error.message || "").toLowerCase().includes("cancelled")) {
       setActivity(`Preview failed: ${error.message}`, 0);
     }

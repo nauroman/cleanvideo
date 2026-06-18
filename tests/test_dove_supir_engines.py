@@ -3,7 +3,12 @@ from tempfile import TemporaryDirectory
 import unittest
 
 from app.dove_engine import DoveEngine, DoveSettings
-from app.main import ENGINE_VERSION, ProcessSettings
+from app.main import (
+    DOVE_PREVIEW_FRAMES,
+    ENGINE_VERSION,
+    ProcessSettings,
+    preview_output_seek_seconds,
+)
 from app.supir_engine import SupirEngine, SupirSettings
 
 
@@ -95,7 +100,7 @@ class SupirEngineTests(unittest.TestCase):
             self.assertEqual(status["repoPath"], str(root / "external" / "SUPIR"))
             self.assertEqual(status["pythonPath"], str(root / ".venv-supir" / "Scripts" / "python.exe"))
             self.assertEqual(status["configPath"], str(root / "external" / "SUPIR" / "options" / "SUPIR_v0.yaml"))
-            self.assertIn(str(root / "external" / "SUPIR" / "test.py"), status["missing"])
+            self.assertIn(str(root / "scripts" / "supir_cli.py"), status["missing"])
 
     def test_build_command_uses_supir_folder_cli(self) -> None:
         with TemporaryDirectory() as temp_dir:
@@ -111,7 +116,8 @@ class SupirEngineTests(unittest.TestCase):
             )
 
             self.assertEqual(command[0], str(root / ".venv-supir" / "Scripts" / "python.exe"))
-            self.assertIn(str(root / "external" / "SUPIR" / "test.py"), command)
+            self.assertIn(str(root / "scripts" / "supir_cli.py"), command)
+            self.assertNotIn(str(root / "external" / "SUPIR" / "test.py"), command)
             self.assertIn("--img_dir", command)
             self.assertIn(str(input_dir), command)
             self.assertIn("--save_dir", command)
@@ -178,6 +184,49 @@ class EngineRegistryTests(unittest.TestCase):
         self.assertEqual(supir_settings.upscale, 1)
         self.assertEqual(supir_settings.edm_steps, 4)
         self.assertEqual(supir_settings.min_size, 256)
+
+    def test_dove_preview_matches_user_video_settings(self) -> None:
+        request = ProcessSettings(
+            engine="dove",
+            scaleBy="longest_side",
+            targetLongestSide=1280,
+            doveChunkLength=9,
+            doveTemporalOverlap=8,
+        )
+        settings = request.to_dove_preview(640)
+        export_settings = request.to_dove(640)
+
+        self.assertGreaterEqual(DOVE_PREVIEW_FRAMES, 17)
+        self.assertEqual(settings.upscale, export_settings.upscale)
+        self.assertEqual(settings.target_longest_side, export_settings.target_longest_side)
+        self.assertEqual(settings.chunk_len, export_settings.chunk_len)
+        self.assertEqual(settings.overlap_t, export_settings.overlap_t)
+
+    def test_supir_preview_matches_user_image_settings(self) -> None:
+        request = ProcessSettings(
+            engine="supir",
+            scaleBy="longest_side",
+            targetLongestSide=1280,
+            supirSteps=50,
+            supirMinSize=1024,
+        )
+        settings = request.to_supir_preview(640)
+        export_settings = request.to_supir(640)
+
+        self.assertEqual(settings.upscale, export_settings.upscale)
+        self.assertEqual(settings.target_longest_side, export_settings.target_longest_side)
+        self.assertEqual(settings.edm_steps, export_settings.edm_steps)
+        self.assertEqual(settings.min_size, export_settings.min_size)
+
+    def test_single_frame_preview_extracts_first_output_frame(self) -> None:
+        seconds = preview_output_seek_seconds(
+            requested_seconds=84.743,
+            clip_start_seconds=84.743,
+            clip_duration_seconds=0.04,
+            clip_frames=1,
+        )
+
+        self.assertEqual(seconds, 0.0)
 
 
 if __name__ == "__main__":
